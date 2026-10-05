@@ -1,0 +1,20 @@
+[Unit]
+Description=KumaBoard agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kuma-agent
+Group=kuma-agent
+ExecStart=/opt/kuma-agent/kuma-agent run -config /etc/kuma-agent/config.yaml
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kuma-agent
+PrivateTmp=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

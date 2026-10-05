@@ -1,0 +1,8 @@
+# Dev release signing keys (NOT for production)
+# Public (current): de188715c802295ffd1a385561a706c558ac1fc9a3288fc2bc4c7468d14ebbf1
+# Public (next):    <empty for now>
+# NOTE: key rotated 2026-09-26 — previous keypair (990f19f1...) private half was lost
+# (gitignored, never committed). Private half lives on the control plane at
+# data_dir/pki/release_ed25519 (root:root 0600 in production).
+RELEASE_KEY_CURRENT=de188715c802295ffd1a385561a706c558ac1fc9a3288fc2bc4c7468d14ebbf1
+RELEASE_KEY_NEXT=

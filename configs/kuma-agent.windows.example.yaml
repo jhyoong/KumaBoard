@@ -1,0 +1,21 @@
+# C:\ProgramData\kuma-agent\config.yaml  (Windows, SCM service)
+device:
+  name: windows-headless
+
+server:
+  url: wss://192.168.1.150:8443/ws
+  ca_file: C:\ProgramData\kuma-agent\ca.pem
+
+token_file: C:\ProgramData\kuma-agent\token
+
+capabilities:
+  - metrics
+  - custom-commands
+  - wol-target
+
+commands:
+  sleep:
+    description: "Put the machine to sleep"
+    run: ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\scripts\\sleep.ps1"]
+    timeout_s: 15
+    expect_disconnect: true

@@ -1,0 +1,6 @@
+[Unit]
+Description=KumaBoard nightly backup
+
+[Service]
+Type=oneshot
+ExecStart=/opt/kumaboard/backup.sh

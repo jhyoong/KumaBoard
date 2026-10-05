@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.llm-server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/llm-server</string>
+    <string>serve</string>
+  </array>
+  <key>UserName</key><string>OPERATOR_USER</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/llm-server.log</string>
+  <key>StandardErrorPath</key><string>/var/log/llm-server.log</string>
+</dict>
+</plist>

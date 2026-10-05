@@ -1,0 +1,1 @@
+kuma-agent ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/local.llm-server

@@ -1,0 +1,13 @@
+# /etc/kuma-agent/config.yaml  (Raspberry Pi and other lightweight Linux devices)
+# Metrics only: no commands, and nothing that reads logs from the SD card.
+device:
+  name: pi
+
+server:
+  url: wss://192.168.1.150:8443/ws
+  ca_file: /etc/kuma-agent/ca.pem
+
+token_file: /etc/kuma-agent/token
+
+capabilities:
+  - metrics

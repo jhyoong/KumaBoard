@@ -1,0 +1,9 @@
+# /etc/kumaboard/config.yaml
+listen_addrs: ["192.168.1.150:8443"]
+hostnames: []
+data_dir: /var/lib/kumaboard
+wol:
+  interface: eth0
+  broadcast: 192.168.1.255
+metrics_interval_s: 30
+heartbeat_interval_s: 15

@@ -1,0 +1,20 @@
+# /etc/kuma-agent/config.yaml  (Linux, systemd)
+device:
+  name: linux-box            # must match the name registered on the server
+
+server:
+  url: wss://192.168.1.150:8443/ws
+  ca_file: /etc/kuma-agent/ca.pem
+
+token_file: /etc/kuma-agent/token
+
+capabilities:
+  - metrics
+  # - gpu                    # NVIDIA / AMD / Intel GPU metrics, if the host has one
+  - custom-commands
+
+commands:
+  uptime:
+    description: "Show system uptime"
+    run: ["/usr/bin/uptime"]
+    timeout_s: 5

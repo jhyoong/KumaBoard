@@ -1,0 +1,20 @@
+[Unit]
+Description=KumaBoard control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kumaboard
+Group=kumaboard
+ExecStart=/opt/kumaboard/kumaboard serve -config /etc/kumaboard/config.yaml
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kumaboard
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

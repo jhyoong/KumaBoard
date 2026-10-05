@@ -1,0 +1,61 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/
+
+# Build output
+bin/
+
+# Release artifacts
+releases/
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+
+# Dev release signing private key (never commit)
+configs/dev-release.key
+
+# Docs containing personal/homelab data (device names, IPs, tokens guidance)
+docs/DEVICE-SETUP.md
+docs/TODO.md
+docs/phase0checklist.txt
+
+# Local-run systemd unit (contains local paths/topology)
+deploy/systemd/kumaboard-local.service
+
+# Control-plane local runtime data: DB, PKI private keys, staged releases
+data-local/
+
+# Real deploy targets (SSH users, addresses); see deploy/hosts.example.mk
+deploy/hosts.local.mk
+
+# Local scratch files
+.scratch-*

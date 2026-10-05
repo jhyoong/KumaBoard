@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/* `dark:` utilities follow data-theme on <html> (set pre-paint by index.html). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+ * Design tokens. Utilities like bg-surface / text-fg-muted / border-border /
+ * stroke-chart-1 resolve to var(--color-*), so they re-theme automatically.
+ * Light values live here; dark overrides are in :root[data-theme="dark"].
+ * `static` emits every token even when no utility uses it, so components can
+ * read them directly (e.g. style={{ stroke: 'var(--color-chart-1)' }}).
+ */
+@theme static {
+  /* Surfaces */
+  --color-canvas: #f9fafb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f3f4f6;
+  --color-inset: #ffffff;
+
+  /* Text */
+  --color-fg: #111827;
+  --color-fg-muted: #4b5563;
+  --color-fg-subtle: #6b7280;
+
+  /* Lines */
+  --color-border: #e5e7eb;
+  --color-border-strong: #d1d5db;
+
+  /* Interactive */
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-on-accent: #ffffff;
+  --color-link: #2563eb;
+  --color-focus: #3b82f6;
+  --color-neutral-action: #1f2937;
+  --color-neutral-action-hover: #374151;
+
+  /* Status: text colour, soft background, soft border */
+  --color-success: #15803d;
+  --color-success-soft: #dcfce7;
+  --color-success-line: #bbf7d0;
+  --color-warning: #a16207;
+  --color-warning-soft: #fef9c3;
+  --color-danger: #b91c1c;
+  --color-danger-soft: #fef2f2;
+  --color-danger-strong: #dc2626;
+  --color-danger-line: #fca5a5;
+  --color-info: #1d4ed8;
+  --color-info-soft: #eff6ff;
+
+  /* Charts / sparklines */
+  --color-chart-1: #2563eb;
+  --color-chart-2: #059669;
+  --color-chart-3: #d97706;
+  --color-chart-4: #7c3aed;
+  --color-chart-5: #db2777;
+  --color-chart-6: #0891b2;
+  --color-chart-axis: #9ca3af;
+  --color-chart-grid: #e5e7eb;
+  --color-chart-fill: rgb(37 99 235 / 0.12);
+}
+
+:root[data-theme="dark"] {
+  --color-canvas: #0b0f17;
+  --color-surface: #151b26;
+  --color-surface-muted: #1f2733;
+  --color-inset: #0f141d;
+
+  --color-fg: #e5e7eb;
+  --color-fg-muted: #a3acb9;
+  --color-fg-subtle: #8a94a3;
+
+  --color-border: #2a3341;
+  --color-border-strong: #3b4555;
+
+  --color-accent: #2563eb;
+  --color-accent-hover: #3b82f6;
+  --color-on-accent: #ffffff;
+  --color-link: #60a5fa;
+  --color-focus: #60a5fa;
+  --color-neutral-action: #374151;
+  --color-neutral-action-hover: #4b5563;
+
+  --color-success: #4ade80;
+  --color-success-soft: rgb(34 197 94 / 0.15);
+  --color-success-line: rgb(34 197 94 / 0.35);
+  --color-warning: #facc15;
+  --color-warning-soft: rgb(234 179 8 / 0.15);
+  --color-danger: #f87171;
+  --color-danger-soft: rgb(239 68 68 / 0.15);
+  --color-danger-strong: #dc2626;
+  --color-danger-line: rgb(248 113 113 / 0.45);
+  --color-info: #93c5fd;
+  --color-info-soft: rgb(59 130 246 / 0.15);
+
+  --color-chart-1: #60a5fa;
+  --color-chart-2: #34d399;
+  --color-chart-3: #fbbf24;
+  --color-chart-4: #a78bfa;
+  --color-chart-5: #f472b6;
+  --color-chart-6: #22d3ee;
+  --color-chart-axis: #6b7280;
+  --color-chart-grid: #2a3341;
+  --color-chart-fill: rgb(96 165 250 / 0.18);
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-fg);
+  }
+
+  /* Tailwind v4 defaults bare `border` to currentColor; use the token instead. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border);
+  }
+
+  input,
+  select,
+  textarea {
+    background-color: var(--color-inset);
+    color: var(--color-fg);
+  }
+}
