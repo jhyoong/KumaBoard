@@ -45,6 +45,7 @@ configs/dev-release.key
 
 # Docs containing personal/homelab data (device names, IPs, tokens guidance)
 docs/DEVICE-SETUP.md
+docs/DEPLOYED.md
 docs/TODO.md
 docs/phase0checklist.txt
 
