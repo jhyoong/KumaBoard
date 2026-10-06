@@ -24,6 +24,10 @@ type Run struct {
 	StdoutTail  string     `json:"stdout_tail"`
 	StderrTail  string     `json:"stderr_tail"`
 	Truncated   bool       `json:"truncated"`
+	// OutputSeq is set only on a run still in flight whose tails were filled
+	// from the hub's live buffers: the seq of the last run_output event they
+	// include. Not stored.
+	OutputSeq int `json:"output_seq,omitempty"`
 }
 
 const runCols = `r.id, r.device_id, d.name, r.command, r.requested_by, r.requested_at, r.started_at,
@@ -69,8 +73,16 @@ func (s *Store) SetRunStatus(ctx context.Context, id, status string) error {
 	return err
 }
 
-// FinishRun records a terminal status and output.
+// FinishRun records a terminal status and output. Each stream is cut to its
+// last proto.MaxCommandOutput bytes here, whatever the caller passed: the
+// output comes from an agent, and an agent is not trusted to bound it.
 func (s *Store) FinishRun(ctx context.Context, id, status string, exitCode *int, stdout, stderr string, truncated bool) error {
+	if t := proto.TailText(stdout, proto.MaxCommandOutput); len(t) != len(stdout) {
+		stdout, truncated = t, true
+	}
+	if t := proto.TailText(stderr, proto.MaxCommandOutput); len(t) != len(stderr) {
+		stderr, truncated = t, true
+	}
 	var exit any
 	if exitCode != nil {
 		exit = *exitCode

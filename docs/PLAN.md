@@ -155,9 +155,11 @@ The single most important section. Build and test this before any UI work.
 | `hello_ack` | server → agent | Accepted, plus server-tuned intervals and session ID |
 | `ping` / `pong` | both | Liveness |
 | `metrics` | agent → server | CPU, memory, disk, uptime, load; plus optional per-adapter `gpus` array with the `gpu` capability (additive, no version bump; see `docs/research/gpu-metrics.md`) |
-| `command_request` | server → agent | Run a named command from the agent's local definitions |
-| `command_result` | agent → server | Exit code, truncated stdout/stderr, duration — or `dispatched` for `expect_disconnect` commands |
-| `command_output` | agent → server | Optional streaming chunk with a sequence number |
+| `command_request` | server → agent | Run a named command from the agent's local definitions. Payload is `{name}` and nothing else |
+| `command_result` | agent → server | Exit code, the last 64 KiB of stdout/stderr, duration — or `dispatched` for `expect_disconnect` commands |
+| `command_output` | agent → server | Streamed output chunk `{seq, stream, data, skipped}`; envelope `id` is the run ID. Sent by protocol 2 agents |
+| `command_cancel` | server → agent | Stop a run. No payload; envelope `id` is the run ID. Protocol 2 |
+| `commands_update` | agent → server | `{commands, problems, config_error}`: the agent re-read its own config file. Never requested by the server. Protocol 2 |
 | `terminal_open` | server → agent | Ask the agent to dial a terminal socket (v3) |
 | `terminal_open_result` | agent → server | `ok` or `refused` (v3) |
 | `wol_request` | server → agent | Ask a `wol-sender` agent to emit a magic packet. **Defined but dormant** — the server sends WoL directly while the LAN stays flat |
@@ -165,7 +167,9 @@ The single most important section. Build and test this before any UI work.
 | `upgrade_result` | agent → server | Progress and outcome of an upgrade attempt, including rollbacks |
 | `error` | both | Coded error; may precede a close |
 
-All message types are defined in `proto/` from v1, even those nothing sends yet.
+All v1 message types are defined in `proto/` from v1, even those nothing sends yet.
+`command_cancel` and `commands_update` arrived with protocol 2 (see *Protocol version 2*
+below). Both sides log and drop a message type they do not know, so new types are additive.
 
 ### Handshake and version negotiation
 
@@ -231,6 +235,28 @@ off it, never in the same release.
 this is acceptable; the headless Windows box is the likely candidate, so wake and upgrade it before
 retiring a protocol version.
 
+### Protocol version 2
+
+`Version = 2`, `MinSupported = 1`. Version 2 adds, for custom scripts
+(`docs/plans/2026-10-06-custom-scripts-design.md`):
+
+- `commands_update` and `command_cancel` (table above).
+- `confirm` on each declared command, and a `problems` list in `hello` and `commands_update`:
+  commands present in the agent's config but withheld, with the reason.
+- Run statuses `cancelled` and `refused`.
+- `command_output` is now actually sent, with an optional `skipped` flag.
+
+The server only sends `command_cancel` to a session whose `hello` declared protocol 2 or
+later; against a protocol 1 agent the cancel API answers 409. Everything else is additive:
+a protocol 1 agent keeps working unchanged against a protocol 2 server.
+
+**Rollout order: server first.** A protocol 2 agent is rejected by a protocol 1 server, so
+the control plane is upgraded before any agent.
+
+Server-side sanitising applies to all of it, in `hello` and in `commands_update` alike:
+at most 64 commands, names must match `^[a-z0-9][a-z0-9-]{0,62}$` (others are dropped, as are
+repeats), descriptions, problem reasons and `config_error` are cut to 256 bytes.
+
 ### Upgrade messages (frozen at protocol v1)
 
 These are the repair path for any agent the server still accepts, so they must never be the
@@ -294,15 +320,34 @@ removed.
 
 ### Commands and correlation
 
-- `command_request` carries the command **name only**, never a shell string.
+- `command_request` carries the command **name only**, never a shell string and never
+  arguments. Extra fields in the payload are not read.
 - The agent looks the name up in its local config. Unknown name → `command_result` with
   `status: "unknown_command"`. Nothing is executed.
 - One run of a given command per device at a time; a second request while one is running
-  returns `status: "busy"`.
+  returns `status: "busy"`. The lock is per command name: different commands may overlap.
 - The server times out a request at the command's declared timeout plus 5s and records
   `status: "timeout"`.
-- stdout and stderr are captured to a cap (64 KiB each). Beyond that, the result is flagged
-  truncated. Long-running output uses `command_output` chunks with sequence numbers.
+- **Output: the last 64 KiB per stream, at every layer.** While a command runs the agent
+  sends what was written since the previous flush as `command_output`, every 250ms, holding
+  back an incomplete trailing UTF-8 sequence. If more than 64 KiB arrived within one flush,
+  only the newest 64 KiB is sent and the chunk is marked `skipped`, which bounds the wire at
+  about 256 KiB/s per stream. The final `command_result` carries the tail, with `truncated`
+  set when anything was dropped from the front, and is authoritative. The server keeps its
+  own last-64-KiB buffer per stream and cuts oversized chunks and results itself, because
+  the agent is untrusted; it forwards each chunk to the dashboard as an SSE `run_output`
+  event and serves the in-flight tail from `GET /api/runs/{id}`. Earlier output is gone for
+  good: nothing writes a full log, so a script that needs one writes its own file.
+  `expect_disconnect` commands do not stream.
+- **Cancel.** `POST /api/runs/{id}/cancel` makes the server send `command_cancel` with the
+  run ID. The agent sends SIGTERM to the command's process group, SIGKILL after 3s (on
+  Windows it terminates the run's Job Object at once), and reports `status: "cancelled"`.
+  The run stays `running` until that result arrives; the timeout remains the backstop. A
+  cancel for a run that is finished, `dispatched`, or on a protocol 1 agent is a 409.
+- **Reload.** The agent polls its own config file every 5s. When the `commands:` block
+  changes it swaps the set in and sends `commands_update`; if the file does not parse it
+  keeps the previous set and reports `config_error`. A run in flight keeps the definition it
+  started with. The server has no message that triggers a re-read.
 
 **Commands that drop the connection** (sleep, reboot, shutdown) are marked
 `expect_disconnect: true` in the agent config and declared in `hello`:
@@ -320,7 +365,8 @@ buffering, no delivery after reconnect, no automatic retry. On server startup, a
 that way everywhere, including wake-run-sleep.
 
 Run statuses: `running`, `ok`, `failed` (nonzero exit), `timeout`, `unknown_command`, `busy`,
-`dispatched`, `disconnected_as_expected`, `no_disconnect`, `lost`.
+`dispatched`, `disconnected_as_expected`, `no_disconnect`, `lost`, `cancelled` (stopped by
+`command_cancel`), `refused` (the script permission check failed immediately before exec).
 
 ### Terminal sessions (v3)
 
@@ -468,13 +514,31 @@ the headless Windows box is the single worst configuration available on this net
 
 ### Command execution rules
 
-- Commands are defined **only** in agent-side config. The server can never send a shell string.
-- If a command ever accepts a parameter, it is passed as an argv element to `exec`, never
-  concatenated into `sh -c`.
-- Parameters, when they exist, are validated against an allowlist pattern declared alongside
-  the command.
+- Commands are defined **only** in agent-side config. No API call, message or dashboard
+  action can create, edit or enable one, and the server can never send a shell string.
+- **Commands take no parameters.** `command_request` carries a name, `command_cancel` carries
+  a run ID, and nothing else is read from either. A compromised dashboard or server can
+  choose *which* declared command to start or stop, never *what* it executes.
+- The server cannot trigger a config re-read. Reload is driven only by the agent polling its
+  own file, which its account cannot write.
 - Commands run with a fixed minimal environment (explicit `PATH`, working directory set to
   the binary dir). Use absolute paths in `run`.
+- **Script permission check.** For each command's `script`, and for `run[0]` when it is an
+  absolute path, the agent verifies that its own account cannot modify what will run: the
+  path is resolved component by component, following symlinks by hand, and the final file
+  and every directory on the way must not be writable by the agent (Unix: not owned by the
+  agent's uid and `access(W_OK)` fails; as root, no group or world write bit. Windows: the
+  kernel refuses every write, delete, DACL and owner right). A command that fails is not
+  declared, so it has no button, and is reported as a problem on the device page. The check
+  is repeated on every poll and again immediately before exec, where a failure ends the run
+  as `refused`; the resolved path is what gets executed. This closes the gap where the
+  config is root-owned but a script it names is not: a compromised agent, or a web-terminal
+  session running as the same account, could otherwise rewrite the script behind a button.
+  Scripts live in a root/Administrators-owned directory (`/opt/kuma-scripts`,
+  `C:\kuma-scripts`) created by the setup scripts.
+- Output is bounded by the server, not just the agent: the last 64 KiB per stream.
+- `confirm: true` makes the dashboard ask before starting. It is enforced in the browser,
+  guards against misclicks only, and is **not** a security control.
 
 ### Terminal policy (v3)
 
@@ -628,13 +692,21 @@ capabilities:
 commands:
   sleep:
     description: "Put the machine to sleep"
-    run: ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\scripts\\sleep.ps1"]
+    run: ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+    script: C:\kuma-scripts\sleep.ps1
     timeout_s: 15
     expect_disconnect: true
 ```
 
 Note `run` is an **argv array**, not a string. This is the difference between a command
-runner and a remote shell. `C:\scripts\` must not be writable by the agent account.
+runner and a remote shell.
+
+A command is `run`, `script`, or both. `script` is the absolute path of a script file: argv
+is `run + [script]`, or the script alone (executed directly, shebang and x bit) when there is
+no `run`. It exists so the agent knows which file to protect; see *Command execution rules*.
+`confirm: true` asks before starting. There is one concept, not two: a script is a command,
+with the same runner, table, history and audit. `commands:` is re-read while the agent runs;
+`device`, `server`, `token_file` and `capabilities` still need a restart.
 
 ### Responsibilities
 
@@ -686,9 +758,13 @@ SQLite, WAL mode, with the frontend embedded in the server binary. Use a pure-Go
 devices             id, name, os, arch, token_hash, capabilities_json,
                     schedule_json, normally_off, terminal_enabled,
                     last_seen, agent_version, desired_agent_version,
-                    protocol_version, created_at
-commands            device_id, name, description, timeout_s, updated_at
-                    (refreshed from the agent at each handshake)
+                    protocol_version, commands_config_error, created_at
+commands            device_id, name, description, timeout_s, expect_disconnect,
+                    confirm, updated_at
+                    (refreshed from the agent at each handshake and on each
+                    commands_update)
+command_problems    device_id, name, reason
+                    (commands the agent withheld; replaced with commands)
 command_runs        id, device_id, command, requested_by, requested_at,
                     started_at, finished_at, exit_code, status,
                     stdout_tail, stderr_tail, truncated

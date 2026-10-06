@@ -32,6 +32,13 @@ import (
 type recorder struct {
 	mu     sync.Mutex
 	events []string
+	output []recordedOutput
+}
+
+type recordedOutput struct {
+	runID string
+	seq   int
+	o     proto.CommandOutput
 }
 
 func (r *recorder) add(s string) {
@@ -44,6 +51,12 @@ func (r *recorder) DeviceDisconnected(name string)               { r.add("discon
 func (r *recorder) MetricsReceived(name string, m proto.Metrics) { r.add("metrics:" + name) }
 func (r *recorder) RunChanged(runID string)                      { r.add("run:" + runID) }
 func (r *recorder) UpgradeChanged(name string)                   { r.add("upgrade:" + name) }
+func (r *recorder) CommandsChanged(name string)                  { r.add("commands:" + name) }
+func (r *recorder) RunOutput(runID, device string, seq int, o proto.CommandOutput) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.output = append(r.output, recordedOutput{runID, seq, o})
+}
 func (r *recorder) count(s string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

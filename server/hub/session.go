@@ -17,6 +17,9 @@ type Session struct {
 	ID         string
 	DeviceID   int64
 	DeviceName string
+	// ProtocolVersion is what the agent declared in hello. Messages added
+	// after version 1 are only sent to sessions that speak them.
+	ProtocolVersion int
 
 	conn      *websocket.Conn
 	writeMu   sync.Mutex

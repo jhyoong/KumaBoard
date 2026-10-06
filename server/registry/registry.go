@@ -27,21 +27,37 @@ type Summary struct {
 	DesiredAgentVersion string             `json:"desired_agent_version"`
 	Capabilities        []string           `json:"capabilities"`
 	Commands            []proto.CommandDef `json:"commands"`
-	MAC                 string             `json:"mac"`
-	NormallyOff         bool               `json:"normally_off"`
-	TerminalEnabled     bool               `json:"terminal_enabled"`
-	Schedule            store.Schedule     `json:"schedule"`
-	LastSeen            *time.Time         `json:"last_seen"`
-	LastDisconnectAt    *time.Time         `json:"last_disconnect_at"`
-	Incompatible        bool               `json:"incompatible"`
-	RejectReason        string             `json:"reject_reason"`
-	Metrics             *proto.Metrics     `json:"metrics"`
+	// CommandProblems are commands in the agent's config that it withheld,
+	// with its reason. CommandsConfigError is why its last config reload was
+	// rejected. Both are the agent's own words: display only.
+	CommandProblems     []proto.CommandProblem `json:"command_problems"`
+	CommandsConfigError string                 `json:"commands_config_error"`
+	MAC                 string                 `json:"mac"`
+	NormallyOff         bool                   `json:"normally_off"`
+	TerminalEnabled     bool                   `json:"terminal_enabled"`
+	Schedule            store.Schedule         `json:"schedule"`
+	LastSeen            *time.Time             `json:"last_seen"`
+	LastDisconnectAt    *time.Time             `json:"last_disconnect_at"`
+	Incompatible        bool                   `json:"incompatible"`
+	RejectReason        string                 `json:"reject_reason"`
+	Metrics             *proto.Metrics         `json:"metrics"`
 }
 
 // MetricsEvent is the payload of the "metrics" SSE event.
 type MetricsEvent struct {
 	Device  string        `json:"device"`
 	Metrics proto.Metrics `json:"metrics"`
+}
+
+// RunOutputEvent is the payload of the "run_output" SSE event: one chunk of
+// a running command's output. Seq counts from 1 per run.
+type RunOutputEvent struct {
+	RunID   string `json:"run_id"`
+	Device  string `json:"device"`
+	Seq     int    `json:"seq"`
+	Stream  string `json:"stream"`
+	Data    string `json:"data"`
+	Skipped bool   `json:"skipped"`
 }
 
 type entry struct {
@@ -157,6 +173,18 @@ func (r *Registry) RunChanged(runID string) {
 	r.pub.Publish("run", run)
 }
 
+// RunOutput implements hub.Events.
+func (r *Registry) RunOutput(runID, device string, seq int, o proto.CommandOutput) {
+	r.pub.Publish("run_output", RunOutputEvent{
+		RunID: runID, Device: device, Seq: seq, Stream: o.Stream, Data: o.Data, Skipped: o.Skipped,
+	})
+}
+
+// CommandsChanged implements hub.Events.
+func (r *Registry) CommandsChanged(name string) {
+	r.publishDevice(context.Background(), name)
+}
+
 // UpgradeChanged implements hub.Events.
 func (r *Registry) UpgradeChanged(name string) {
 	r.publishDevice(context.Background(), name)
@@ -179,11 +207,19 @@ func (r *Registry) Summary(ctx context.Context, name string) (*Summary, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.summariseDevice(ctx, d)
+}
+
+func (r *Registry) summariseDevice(ctx context.Context, d *store.Device) (*Summary, error) {
 	cmds, err := r.st.ListCommands(ctx, d.ID)
 	if err != nil {
 		return nil, err
 	}
-	return r.summarise(d, cmds), nil
+	problems, err := r.st.ListCommandProblems(ctx, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	return r.summarise(d, cmds, problems), nil
 }
 
 // Summaries builds the dashboard view of every device.
@@ -194,16 +230,16 @@ func (r *Registry) Summaries(ctx context.Context) ([]Summary, error) {
 	}
 	out := make([]Summary, 0, len(devices))
 	for _, d := range devices {
-		cmds, err := r.st.ListCommands(ctx, d.ID)
+		s, err := r.summariseDevice(ctx, d)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, *r.summarise(d, cmds))
+		out = append(out, *s)
 	}
 	return out, nil
 }
 
-func (r *Registry) summarise(d *store.Device, cmds []proto.CommandDef) *Summary {
+func (r *Registry) summarise(d *store.Device, cmds []proto.CommandDef, problems []proto.CommandProblem) *Summary {
 	r.mu.Lock()
 	e := r.ensureLocked(d.Name)
 	e.state = Derive(r.now(), e.connected, e.lastMetrics, r.interval, d.NormallyOff, d.Schedule)
@@ -211,6 +247,7 @@ func (r *Registry) summarise(d *store.Device, cmds []proto.CommandDef) *Summary 
 		Name: d.Name, State: e.state, Connected: e.connected,
 		OS: d.OS, Arch: d.Arch, AgentVersion: d.AgentVersion, ProtocolVersion: d.ProtocolVersion,
 		DesiredAgentVersion: d.DesiredAgentVersion, Capabilities: d.Capabilities, Commands: cmds,
+		CommandProblems: problems, CommandsConfigError: d.CommandsConfigError,
 		MAC: d.MAC, NormallyOff: d.NormallyOff, TerminalEnabled: d.TerminalEnabled, Schedule: d.Schedule,
 		LastSeen: d.LastSeen, LastDisconnectAt: d.LastDisconnectAt,
 		Incompatible: !e.connected && d.LastRejectReason == proto.ErrProtocolVersionUnsupported,

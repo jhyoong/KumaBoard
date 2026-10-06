@@ -38,6 +38,8 @@ type App struct {
 	mu             sync.Mutex
 	cancel         context.CancelFunc
 	probationTimer *time.Timer
+	send           transport.Sender // current connection, nil while disconnected
+	watch          configWatch
 
 	// Terminal sessions live under rootCtx, not the control connection, so a
 	// reconnect leaves them running. They end when their own socket closes,
@@ -72,6 +74,9 @@ func New(cfg *config.Config, log *slog.Logger, startupResult upgrade.StartupResu
 		terms:    map[*liveTerminal]struct{}{},
 	}
 	a.rootCtx, a.rootCancel = context.WithCancel(context.Background())
+	a.watch.interval = defaultConfigPoll
+	a.watch.poke = make(chan struct{}, 1)
+	go a.watchConfig(a.rootCtx)
 	base := cfg.Server.URL
 	base = strings.TrimSuffix(base, "/ws")
 	base = strings.Replace(base, "wss://", "https://", 1)
@@ -114,8 +119,15 @@ func (a *App) SetDispatchDelay(d time.Duration) { a.runner.DispatchDelay = d }
 // Useful in tests.
 func (a *App) SetCollector(c *collectors.Collector) { a.collector = c }
 
-// Hello builds the handshake payload.
+// Hello builds the handshake payload. The commands are the current set, so a
+// reload that happened while disconnected is declared here.
 func (a *App) Hello() proto.Hello {
+	cur := a.currentCommands()
+	a.mu.Lock()
+	// Hello has no config_error field: a pending one follows in a
+	// commands_update once connected.
+	a.watch.announced = &commandState{defs: cur.defs, problems: cur.problems}
+	a.mu.Unlock()
 	return proto.Hello{
 		ProtocolVersion: proto.Version,
 		AgentVersion:    buildinfo.Version,
@@ -124,7 +136,8 @@ func (a *App) Hello() proto.Hello {
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
 		Capabilities:    a.cfg.Capabilities,
-		Commands:        a.cfg.CommandDefs(),
+		Commands:        cur.defs,
+		Problems:        cur.problems,
 	}
 }
 
@@ -137,6 +150,9 @@ func (a *App) OnConnected(ack proto.HelloAck, send transport.Sender) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
+	a.send = send
+	// Covers a config error, or a reload, from between hello and now.
+	go a.announceCommands()
 	interval := time.Duration(ack.MetricsIntervalS) * time.Second
 	if interval <= 0 {
 		interval = 30 * time.Second
@@ -183,6 +199,7 @@ func (a *App) OnDisconnected() {
 		a.cancel()
 		a.cancel = nil
 	}
+	a.send = nil
 }
 
 // OnMessage handles server messages.
@@ -193,13 +210,20 @@ func (a *App) OnMessage(env *proto.Envelope, send transport.Sender) {
 		if err := env.Unmarshal(&req); err != nil {
 			return
 		}
-		go a.runner.Execute(context.Background(), req.Name, func(res proto.CommandResult) error {
+		// Only the name is read from the request, and the run ID is the
+		// envelope ID: the server never supplies arguments.
+		go a.runner.Execute(context.Background(), env.ID, req.Name, func(res proto.CommandResult) error {
 			reply, err := proto.Reply(env, proto.TypeCommandResult, res)
 			if err != nil {
 				return err
 			}
 			return send.Send(reply)
-		})
+		}, commandOutput(env, send))
+	case proto.TypeCommandCancel:
+		// No payload: the envelope ID names the run. Unknown IDs are ignored.
+		if !a.runner.Cancel(env.ID) {
+			a.log.Debug("cancel for unknown run", "id", env.ID)
+		}
 	case proto.TypeUpgradeRequest:
 		var req proto.UpgradeRequest
 		if err := env.Unmarshal(&req); err != nil {

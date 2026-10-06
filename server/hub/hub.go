@@ -25,7 +25,13 @@ type Events interface {
 	DeviceDisconnected(name string)
 	MetricsReceived(name string, m proto.Metrics)
 	RunChanged(runID string)
+	// RunOutput is one chunk of a running command's output, already bounded
+	// by the server. seq counts from 1 per run and is assigned by the server.
+	RunOutput(runID, device string, seq int, o proto.CommandOutput)
 	UpgradeChanged(name string)
+	// CommandsChanged fires when a device replaced its declared commands
+	// while connected.
+	CommandsChanged(name string)
 }
 
 // Options configures a Hub.
@@ -140,17 +146,20 @@ func (h *Hub) authenticate(ctx context.Context, hello *proto.Hello, remote strin
 			"agent protocol "+strconv.Itoa(hello.ProtocolVersion)+" version "+hello.AgentVersion)
 		return nil, proto.ErrProtocolVersionUnsupported
 	}
-	if err := st.RecordHandshake(ctx, d.ID, hello.OS, hello.Arch, hello.AgentVersion, hello.ProtocolVersion, hello.Capabilities, hello.Commands); err != nil {
+	// Everything in hello is untrusted, the command declarations included.
+	cmds, problems := proto.SanitizeCommands(hello.Commands), proto.SanitizeProblems(hello.Problems)
+	if err := st.RecordHandshake(ctx, d.ID, hello.OS, hello.Arch, hello.AgentVersion, hello.ProtocolVersion, hello.Capabilities, cmds, problems); err != nil {
 		h.opts.Log.Error("record handshake", "device", d.Name, "err", err)
 		return nil, proto.ErrProtocol
 	}
 	st.Audit(ctx, "agent:"+d.Name, "handshake", d.Name, "ok", "version "+hello.AgentVersion)
 	return &Session{
-		ID:         ulid.Make().String(),
-		DeviceID:   d.ID,
-		DeviceName: d.Name,
-		closed:     make(chan struct{}),
-		log:        h.opts.Log,
+		ID:              ulid.Make().String(),
+		DeviceID:        d.ID,
+		DeviceName:      d.Name,
+		ProtocolVersion: hello.ProtocolVersion,
+		closed:          make(chan struct{}),
+		log:             h.opts.Log,
 	}, ""
 }
 
@@ -205,6 +214,8 @@ func (h *Hub) handleMessage(ctx context.Context, s *Session, env *proto.Envelope
 		h.handleCommandResult(ctx, s, env)
 	case proto.TypeCommandOutput:
 		h.handleCommandOutput(s, env)
+	case proto.TypeCommandsUpdate:
+		h.handleCommandsUpdate(ctx, s, env)
 	case proto.TypeUpgradeResult:
 		h.handleUpgradeResult(ctx, s, env)
 	case proto.TypeTerminalOpenResult:

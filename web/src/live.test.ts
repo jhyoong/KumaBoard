@@ -76,6 +76,18 @@ describe('parseEvent', () => {
     expect(parseEvent('metrics', '{"device":"a"}')).toBeNull();
     expect(parseEvent('bogus', '{"name":"a"}')).toBeNull();
   });
+
+  it('maps run_output and rejects malformed chunks', () => {
+    expect(parseEvent('run_output', '{"run_id":"r1","device":"a","seq":3,"stream":"stderr","data":"x\\n","skipped":true}'))
+      .toEqual({ type: 'run_output', output: { run_id: 'r1', device: 'a', seq: 3, stream: 'stderr', data: 'x\n', skipped: true } });
+    // skipped defaults to false; unknown fields are not carried along.
+    expect(parseEvent('run_output', '{"run_id":"r1","device":"a","seq":1,"stream":"stdout","data":"","extra":1}'))
+      .toEqual({ type: 'run_output', output: { run_id: 'r1', device: 'a', seq: 1, stream: 'stdout', data: '', skipped: false } });
+    expect(parseEvent('run_output', '{"run_id":"r1","device":"a","seq":1,"stream":"stdlog","data":"x"}')).toBeNull();
+    expect(parseEvent('run_output', '{"run_id":"r1","device":"a","seq":"1","stream":"stdout","data":"x"}')).toBeNull();
+    expect(parseEvent('run_output', '{"device":"a","seq":1,"stream":"stdout","data":"x"}')).toBeNull();
+    expect(parseEvent('run_output', '{"run_id":"r1","device":"a","seq":1,"stream":"stdout"}')).toBeNull();
+  });
 });
 
 describe('LiveSync', () => {

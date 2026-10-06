@@ -404,7 +404,7 @@ Services". Do not add it to "Deny log on as a service". Never run the agent as S
 .\deploy\windows\setup.ps1
 ```
 
-This creates `C:\ProgramData\kuma-agent\` with restricted ACLs and `C:\scripts\`.
+This creates `C:\ProgramData\kuma-agent\` with restricted ACLs and `C:\kuma-scripts\`.
 
 #### 3. Install files
 
@@ -423,7 +423,7 @@ Set-Content C:\ProgramData\kuma-agent\token '<token>'
 icacls C:\ProgramData\kuma-agent\token /inheritance:r /grant:r 'Administrators:F' 'kuma-agent:R'
 
 # Sleep script (only for machines that should sleep on command)
-Copy-Item deploy\windows\sleep.ps1 C:\scripts\sleep.ps1
+Copy-Item deploy\windows\sleep.ps1 C:\kuma-scripts\sleep.ps1
 ```
 
 #### 4. Install and start the service

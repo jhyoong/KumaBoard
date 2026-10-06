@@ -10,8 +10,13 @@
      random value by -InstallService, so it never has to be typed)
   2. grants SeServiceLogonRight and denies interactive + Remote Desktop logon
      for that account (secedit, verified by re-export)
-  3. creates C:\ProgramData\kuma-agent (+ bin) and C:\scripts with ACLs, and
-     pre-creates agent.log writable by the service account
+  3. creates C:\ProgramData\kuma-agent (+ bin) and C:\kuma-scripts with ACLs,
+     and pre-creates agent.log writable by the service account.
+     C:\kuma-scripts holds the scripts the dashboard can run (script: in
+     config.yaml): owned by Administrators, read + execute only for the
+     service account. The agent checks that itself and withholds the button
+     for any script, or directory on the way to it, that its own account
+     could modify. An older C:\scripts is left as it is.
   With -InstallService (after kuma-agent.exe was copied into bin): registers
   the kuma-agent service under that account.
   With -StageDir <dir> (what deploy-agent.ps1 prints): full install from a
@@ -279,12 +284,18 @@ Add-UserRights -Sid $sid -Rights @('SeDenyInteractiveLogonRight', 'SeDenyRemoteI
 Write-Host "$account : interactive + RDP logon denied, service logon granted"
 
 # --- 3. directories + ACLs -----------------------------------------------------
-foreach ($d in @($base, "$base\bin", 'C:\scripts')) {
+$scripts = 'C:\kuma-scripts'
+foreach ($d in @($base, "$base\bin", $scripts)) {
   if (-not (Test-Path -LiteralPath $d)) { $null = New-Item -ItemType Directory -Path $d; Write-Host "created $d" }
 }
 Invoke-Checked 'icacls.exe' @($base, '/inheritance:r', '/grant:r', 'Administrators:(OI)(CI)F', 'SYSTEM:(OI)(CI)F', "${account}:(OI)(CI)RX")
 Invoke-Checked 'icacls.exe' @("$base\bin", '/grant:r', "${account}:(OI)(CI)M")
-Invoke-Checked 'icacls.exe' @('C:\scripts', '/inheritance:r', '/grant:r', 'Administrators:(OI)(CI)F', 'SYSTEM:(OI)(CI)F', "${account}:(OI)(CI)RX")
+# Scripts directory: Administrators own it, the service account can only
+# read and execute. Inheritance is cut so nothing from C:\ (where every
+# authenticated user may create folders) reaches it, and files copied in
+# inherit these ACEs.
+Invoke-Checked 'icacls.exe' @($scripts, '/setowner', 'Administrators')
+Invoke-Checked 'icacls.exe' @($scripts, '/inheritance:r', '/grant:r', 'Administrators:(OI)(CI)F', 'SYSTEM:(OI)(CI)F', "${account}:(OI)(CI)RX")
 
 # The service opens C:\ProgramData\kuma-agent\agent.log with O_CREATE|O_APPEND
 # (cmd/kuma-agent/platform_windows.go) BEFORE anything else; with only RX on
@@ -323,7 +334,10 @@ if ($StageDir) {
     Copy-Item -LiteralPath (Join-Path $StageDir 'config.yaml') -Destination "$base\config.yaml" -Force
   }
   if (Test-Path -LiteralPath (Join-Path $StageDir 'sleep.ps1')) {
-    Copy-Item -LiteralPath (Join-Path $StageDir 'sleep.ps1') -Destination 'C:\scripts\sleep.ps1' -Force
+    Copy-Item -LiteralPath (Join-Path $StageDir 'sleep.ps1') -Destination "$scripts\sleep.ps1" -Force
+    # a copy keeps the ACEs it inherits from the directory, but make the
+    # owner explicit: an owner can always rewrite the ACL
+    Invoke-Checked 'icacls.exe' @("$scripts\sleep.ps1", '/setowner', 'Administrators')
   }
   if (Test-Path -LiteralPath (Join-Path $StageDir 'token')) {
     # moved, not copied: no plaintext token left in the staging dir

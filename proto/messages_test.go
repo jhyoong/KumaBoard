@@ -218,3 +218,165 @@ func TestMetricsSanitizeTemp(t *testing.T) {
 		t.Fatalf("sensor not truncated cleanly: %d %q", n, m.TempSensor)
 	}
 }
+
+// R2: the dashboard never supplies arguments. A command_request is a name and
+// nothing else, and command_cancel has no payload at all.
+func TestCommandRequestShapeIsNameOnly(t *testing.T) {
+	env, err := New(TypeCommandRequest, CommandRequest{Name: "backup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(env.Payload) != `{"name":"backup"}` {
+		t.Fatalf("command_request payload = %s", env.Payload)
+	}
+	// Extra fields from a hostile peer are not read.
+	in := &Envelope{Type: TypeCommandRequest, Payload: json.RawMessage(`{"name":"backup","args":["-rf","/"],"run":["/bin/sh"]}`)}
+	var req CommandRequest
+	if err := in.Unmarshal(&req); err != nil {
+		t.Fatal(err)
+	}
+	if req != (CommandRequest{Name: "backup"}) {
+		t.Fatalf("got %+v", req)
+	}
+	cancel, err := New(TypeCommandCancel, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Encode(cancel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "payload") {
+		t.Fatalf("command_cancel must carry no payload: %s", b)
+	}
+}
+
+func TestVersionWindow(t *testing.T) {
+	if Version != 2 || MinSupported != 1 {
+		t.Fatalf("version %d min %d", Version, MinSupported)
+	}
+	if !Supported(1) || !Supported(2) || Supported(0) || Supported(3) {
+		t.Fatal("window must be exactly 1..2")
+	}
+}
+
+func TestNewRunStatusesAreTerminal(t *testing.T) {
+	if !IsTerminalRunStatus(RunCancelled) || !IsTerminalRunStatus(RunRefused) {
+		t.Fatal("cancelled and refused are terminal")
+	}
+}
+
+func TestHelloFromV1AgentDecodes(t *testing.T) {
+	old := []byte(`{"protocol_version":1,"device_name":"d","commands":[{"name":"sleep","description":"","timeout_s":15,"expect_disconnect":true}]}`)
+	var h Hello
+	if err := json.Unmarshal(old, &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.Problems != nil || h.Commands[0].Confirm || !h.Commands[0].ExpectDisconnect {
+		t.Fatalf("got %+v", h)
+	}
+}
+
+func TestCommandsUpdateRoundTrip(t *testing.T) {
+	in := CommandsUpdate{
+		Commands:    []CommandDef{{Name: "backup", TimeoutS: 60, Confirm: true}},
+		Problems:    []CommandProblem{{Name: "wipe", Reason: "/opt/x is writable by the agent account"}},
+		ConfigError: "yaml: line 3",
+	}
+	env, err := New(TypeCommandsUpdate, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out CommandsUpdate
+	if err := env.Unmarshal(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Commands[0].Confirm || out.Problems[0] != in.Problems[0] || out.ConfigError != in.ConfigError {
+		t.Fatalf("round trip lost data: %+v", out)
+	}
+}
+
+func TestCommandOutputSkippedOmittedWhenFalse(t *testing.T) {
+	b, _ := json.Marshal(CommandOutput{Seq: 1, Stream: StreamStdout, Data: "x"})
+	if string(b) != `{"seq":1,"stream":"stdout","data":"x"}` {
+		t.Fatalf("got %s", b)
+	}
+	b, _ = json.Marshal(CommandOutput{Seq: 2, Stream: StreamStderr, Skipped: true})
+	if !strings.Contains(string(b), `"skipped":true`) {
+		t.Fatalf("got %s", b)
+	}
+}
+
+func TestSanitizeCommands(t *testing.T) {
+	var in []CommandDef
+	in = append(in,
+		CommandDef{Name: "Bad Name", TimeoutS: 5},
+		CommandDef{Name: "", TimeoutS: 5},
+		CommandDef{Name: "dup", Description: strings.Repeat("é", 300), TimeoutS: -4},
+		CommandDef{Name: "dup", Description: "second"},
+	)
+	for i := range 100 {
+		in = append(in, CommandDef{Name: "c" + strings.Repeat("x", i%5) + "-" + string(rune('a'+i%26)) + string(rune('a'+i/26)), TimeoutS: 1})
+	}
+	out := SanitizeCommands(in)
+	if len(out) != MaxCommands {
+		t.Fatalf("not capped: %d", len(out))
+	}
+	if out[0].Name != "dup" || out[0].TimeoutS != 0 {
+		t.Fatalf("first kept entry: %+v", out[0])
+	}
+	if n := len(out[0].Description); n > MaxCommandTextLen || n == 0 || !utf8.ValidString(out[0].Description) {
+		t.Fatalf("description not truncated cleanly: %d", n)
+	}
+	seen := map[string]bool{}
+	for _, c := range out {
+		if seen[c.Name] {
+			t.Fatalf("duplicate %q survived", c.Name)
+		}
+		seen[c.Name] = true
+	}
+	if got := SanitizeCommands(nil); got == nil || len(got) != 0 {
+		t.Fatalf("nil input must give an empty list: %#v", got)
+	}
+}
+
+func TestSanitizeProblemsAndConfigError(t *testing.T) {
+	in := []CommandProblem{
+		{Name: "../x", Reason: "r"},
+		{Name: "ok", Reason: strings.Repeat("é", 300)},
+		{Name: "ok", Reason: "again"},
+	}
+	for i := range 80 {
+		in = append(in, CommandProblem{Name: "p" + string(rune('a'+i%26)) + string(rune('a'+i/26)), Reason: "r"})
+	}
+	out := SanitizeProblems(in)
+	if len(out) != MaxCommands || out[0].Name != "ok" {
+		t.Fatalf("got %d entries, first %+v", len(out), out[0])
+	}
+	if n := len(out[0].Reason); n > MaxCommandTextLen || !utf8.ValidString(out[0].Reason) {
+		t.Fatalf("reason not truncated cleanly: %d", n)
+	}
+	if e := SanitizeConfigError(strings.Repeat("é", 300) + "\xff"); len(e) > MaxCommandTextLen || !utf8.ValidString(e) {
+		t.Fatalf("config error not bounded: %d", len(e))
+	}
+}
+
+func TestTailText(t *testing.T) {
+	if got := TailText("hello", 10); got != "hello" {
+		t.Fatalf("short input changed: %q", got)
+	}
+	if got := TailText("0123456789", 4); got != "6789" {
+		t.Fatalf("got %q", got)
+	}
+	// Cutting inside "é" (2 bytes) must drop the whole rune, not split it.
+	if got := TailText("aéb", 2); got != "b" {
+		t.Fatalf("got %q", got)
+	}
+	if got := TailText("a\xffb", 8); got != "ab" {
+		t.Fatalf("invalid UTF-8 not dropped: %q", got)
+	}
+	big := strings.Repeat("é", MaxCommandOutput)
+	if got := TailText(big, MaxCommandOutput); len(got) > MaxCommandOutput || !utf8.ValidString(got) {
+		t.Fatalf("tail of %d bytes is %d", len(big), len(got))
+	}
+}

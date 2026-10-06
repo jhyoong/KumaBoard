@@ -14,9 +14,36 @@ import (
 var (
 	ErrNotConnected   = errors.New("hub: device not connected")
 	ErrUnknownCommand = errors.New("hub: command not declared by device")
+	// ErrRunNotInFlight: the run already ended, was dispatched (the device
+	// is expected to drop off), or is not known to this server process.
+	ErrRunNotInFlight = errors.New("hub: run is not in flight")
+	// ErrCancelUnsupported: the agent speaks protocol 1, which has no cancel.
+	ErrCancelUnsupported = errors.New("hub: agent does not support cancel")
 )
 
-const outputCap = 64 << 10
+// outputCap is how much of each stream the server keeps for a run: the last
+// 64 KiB. The agent applies the same bound, but the agent is untrusted, so
+// it is enforced again here on every chunk and on the final result.
+const outputCap = proto.MaxCommandOutput
+
+// tailBuf keeps the newest outputCap bytes appended to it.
+type tailBuf struct {
+	s       string
+	dropped bool // something was cut from the front
+}
+
+// add appends data and returns what of it was kept: a chunk larger than the
+// cap is cut to its own tail first.
+func (b *tailBuf) add(data string) (kept string, cut bool) {
+	kept = proto.TailText(data, outputCap)
+	cut = len(kept) < len(data)
+	joined := b.s + kept
+	b.s = proto.TailText(joined, outputCap)
+	if cut || len(b.s) < len(joined) {
+		b.dropped = true
+	}
+	return kept, cut
+}
 
 type inflight struct {
 	runID      string
@@ -26,8 +53,15 @@ type inflight struct {
 	command    string
 	dispatched bool
 	timer      *time.Timer
-	stdout     strings.Builder
-	stderr     strings.Builder
+	stdout     tailBuf
+	stderr     tailBuf
+	seq        int // run_output events published so far
+}
+
+// output returns the buffered tails. Call with router.mu held, or after the
+// run was removed from the router.
+func (f *inflight) output() (stdout, stderr string, truncated bool) {
+	return f.stdout.s, f.stderr.s, f.stdout.dropped || f.stderr.dropped
 }
 
 type router struct {
@@ -59,25 +93,54 @@ func (r *router) remove(f *inflight) (dispatched bool, ok bool) {
 	return f.dispatched, true
 }
 
+func (r *router) isDispatched(f *inflight) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return f.dispatched
+}
+
 func (r *router) markDispatched(f *inflight) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	f.dispatched = true
 }
 
-func (r *router) appendOutput(f *inflight, stream, data string) {
+// appendOutput adds a chunk to the run's tail buffer and returns what to
+// publish for it: the chunk as kept, and its server-assigned seq. ok is false
+// if the run is gone or the stream unknown.
+func (r *router) appendOutput(f *inflight, o proto.CommandOutput) (out proto.CommandOutput, seq int, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	b := &f.stdout
-	if stream == "stderr" {
+	if _, present := r.runs[f.runID]; !present {
+		return out, 0, false
+	}
+	var b *tailBuf
+	switch o.Stream {
+	case proto.StreamStdout:
+		b = &f.stdout
+	case proto.StreamStderr:
 		b = &f.stderr
+	default:
+		return out, 0, false
 	}
-	if room := outputCap - b.Len(); room > 0 {
-		if len(data) > room {
-			data = data[:room]
-		}
-		b.WriteString(data)
+	if o.Skipped {
+		b.dropped = true
 	}
+	kept, cut := b.add(o.Data)
+	f.seq++
+	return proto.CommandOutput{Seq: f.seq, Stream: o.Stream, Data: kept, Skipped: o.Skipped || cut}, f.seq, true
+}
+
+// snapshot returns the live tails of a run still in flight.
+func (r *router) snapshot(runID string) (stdout, stderr string, truncated bool, seq int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f := r.runs[runID]
+	if f == nil {
+		return "", "", false, 0, false
+	}
+	stdout, stderr, truncated = f.output()
+	return stdout, stderr, truncated, f.seq, true
 }
 
 func (r *router) removeSession(sessionID string) []*inflight {
@@ -147,9 +210,43 @@ func (h *Hub) runTimedOut(f *inflight) {
 		status = proto.RunNoDisconnect
 	}
 	ctx := context.Background()
-	h.opts.Store.FinishRun(ctx, f.runID, status, nil, f.stdout.String(), f.stderr.String(), false)
+	stdout, stderr, truncated := f.output()
+	h.opts.Store.FinishRun(ctx, f.runID, status, nil, stdout, stderr, truncated)
 	h.opts.Store.Audit(ctx, "server", "command_result", f.deviceName+"/"+f.command, status, f.runID)
 	h.opts.Events.RunChanged(f.runID)
+}
+
+// CancelRun asks the agent to stop a run in flight. The run stays running
+// until the agent's command_result arrives; the timeout timer remains the
+// backstop. Only the run ID is sent.
+func (h *Hub) CancelRun(ctx context.Context, runID, requestedBy string) error {
+	f := h.router.get(runID)
+	if f == nil || h.router.isDispatched(f) {
+		return ErrRunNotInFlight
+	}
+	s := h.Session(f.deviceName)
+	if s == nil || s.ID != f.sessionID {
+		return ErrRunNotInFlight
+	}
+	if s.ProtocolVersion < 2 {
+		return ErrCancelUnsupported
+	}
+	env, err := proto.New(proto.TypeCommandCancel, nil)
+	if err != nil {
+		return err
+	}
+	env.ID = runID
+	if err := s.Send(env); err != nil {
+		return err
+	}
+	h.opts.Store.Audit(ctx, requestedBy, "command_cancel", f.deviceName+"/"+f.command, "sent", runID)
+	return nil
+}
+
+// LiveOutput returns the output buffered so far for a run still in flight,
+// and the seq of the last run_output event it includes.
+func (h *Hub) LiveOutput(runID string) (stdout, stderr string, truncated bool, seq int, ok bool) {
+	return h.router.snapshot(runID)
 }
 
 func (h *Hub) handleCommandResult(ctx context.Context, s *Session, env *proto.Envelope) {
@@ -177,11 +274,14 @@ func (h *Hub) handleCommandResult(ctx context.Context, s *Session, env *proto.En
 		v := res.ExitCode
 		exit = &v
 	}
-	stdout, stderr := res.Stdout, res.Stderr
+	// The result's output is authoritative; streamed chunks only stand in
+	// when it carries none. FinishRun cuts both to the last 64 KiB.
+	stdout, stderr, truncated := res.Stdout, res.Stderr, res.Truncated
 	if stdout == "" && stderr == "" {
-		stdout, stderr = f.stdout.String(), f.stderr.String()
+		stdout, stderr, truncated = f.output()
+		truncated = truncated || res.Truncated
 	}
-	h.opts.Store.FinishRun(ctx, f.runID, res.Status, exit, stdout, stderr, res.Truncated)
+	h.opts.Store.FinishRun(ctx, f.runID, res.Status, exit, stdout, stderr, truncated)
 	h.opts.Store.Audit(ctx, "agent:"+s.DeviceName, "command_result", s.DeviceName+"/"+f.command, res.Status, f.runID)
 	h.opts.Events.RunChanged(f.runID)
 }
@@ -195,7 +295,30 @@ func (h *Hub) handleCommandOutput(s *Session, env *proto.Envelope) {
 	if err := env.Unmarshal(&o); err != nil {
 		return
 	}
-	h.router.appendOutput(f, o.Stream, o.Data)
+	if out, seq, ok := h.router.appendOutput(f, o); ok {
+		h.opts.Events.RunOutput(f.runID, f.deviceName, seq, out)
+	}
+}
+
+// handleCommandsUpdate replaces the device's declared commands after the
+// agent re-read its own config. The server never asks for this.
+func (h *Hub) handleCommandsUpdate(ctx context.Context, s *Session, env *proto.Envelope) {
+	var u proto.CommandsUpdate
+	if err := env.Unmarshal(&u); err != nil {
+		return
+	}
+	ch, err := h.opts.Store.ReplaceCommands(ctx, s.DeviceID, proto.SanitizeCommands(u.Commands),
+		proto.SanitizeProblems(u.Problems), proto.SanitizeConfigError(u.ConfigError))
+	if err != nil {
+		h.opts.Log.Error("replace commands", "device", s.DeviceName, "err", err)
+		return
+	}
+	if !ch.Changed {
+		return
+	}
+	detail := "added: " + strings.Join(ch.Added, ",") + "; removed: " + strings.Join(ch.Removed, ",")
+	h.opts.Store.Audit(ctx, "agent:"+s.DeviceName, "commands_update", s.DeviceName, "ok", detail)
+	h.opts.Events.CommandsChanged(s.DeviceName)
 }
 
 // sessionEnded finalises every run the session had in flight.
@@ -206,7 +329,8 @@ func (h *Hub) sessionEnded(ctx context.Context, s *Session) {
 		if f.dispatched {
 			status = proto.RunDisconnectedAsExpected
 		}
-		h.opts.Store.FinishRun(ctx, f.runID, status, nil, f.stdout.String(), f.stderr.String(), false)
+		stdout, stderr, truncated := f.output()
+		h.opts.Store.FinishRun(ctx, f.runID, status, nil, stdout, stderr, truncated)
 		h.opts.Store.Audit(ctx, "server", "command_result", f.deviceName+"/"+f.command, status, f.runID)
 		h.opts.Events.RunChanged(f.runID)
 	}

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { reduce, loadDevices, emptyState } from './state';
-import type { Device, Metrics, Run } from './api';
+import { reduce, loadDevices, emptyState, liveRun, MAX_OUTPUT, SKIP_MARKER } from './state';
+import type { Device, Metrics, Run, RunOutput } from './api';
 
 const stub: Device = {
   name: 'dev1',
@@ -89,5 +89,111 @@ describe('state', () => {
     s = reduce(s, { type: 'run', run: r1done });
     expect(s.runs['dev1']).toHaveLength(2);
     expect(s.runs['dev1'].find((r) => r.id === 'r1')?.status).toBe('ok');
+  });
+});
+
+describe('run_output', () => {
+  const running: Run = {
+    id: 'r1', device: 'dev1', command: 'backup', requested_by: 'admin',
+    requested_at: '', started_at: '', finished_at: '', exit_code: null,
+    status: 'running', stdout_tail: '', stderr_tail: '', truncated: false,
+  };
+  const chunk = (seq: number, data: string, over: Partial<RunOutput> = {}): RunOutput => ({
+    run_id: 'r1', device: 'dev1', seq, stream: 'stdout', data, skipped: false, ...over,
+  });
+  const feed = (s: typeof emptyState, ...chunks: RunOutput[]) =>
+    chunks.reduce((acc, output) => reduce(acc, { type: 'run_output', output }), s);
+  const shown = (s: typeof emptyState, run: Run = running) => liveRun(run, s.output[run.id]);
+
+  it('appends chunks to the matching run, per stream', () => {
+    let s = reduce(emptyState, { type: 'run', run: running });
+    s = feed(s, chunk(1, 'one\n'), chunk(2, 'oops\n', { stream: 'stderr' }), chunk(3, 'two\n'));
+    const r = shown(s);
+    expect(r.stdout_tail).toBe('one\ntwo\n');
+    expect(r.stderr_tail).toBe('oops\n');
+    expect(r.truncated).toBe(false);
+    // The run list itself is untouched; only the overlay changes.
+    expect(s.runs['dev1'][0].stdout_tail).toBe('');
+  });
+
+  it('keeps output for a run it has no row for yet, and other runs apart', () => {
+    const s = feed(emptyState, chunk(1, 'early\n'), chunk(1, 'other\n', { run_id: 'r2' }));
+    expect(shown(s).stdout_tail).toBe('early\n');
+    expect(liveRun({ ...running, id: 'r2' }, s.output['r2']).stdout_tail).toBe('other\n');
+  });
+
+  it('ignores replayed and out-of-order chunks', () => {
+    const s1 = feed(emptyState, chunk(1, 'a'), chunk(2, 'b'));
+    const s2 = feed(s1, chunk(2, 'b'), chunk(1, 'a'));
+    expect(s2).toBe(s1);
+    expect(shown(s2).stdout_tail).toBe('ab');
+  });
+
+  it('trims each stream to the last 64 KiB', () => {
+    const block = 'x'.repeat(10 * 1024);
+    let s = emptyState;
+    for (let i = 1; i <= 20; i++) s = feed(s, chunk(i, i === 20 ? block + 'END' : block));
+    s = feed(s, chunk(21, 'err', { stream: 'stderr' }));
+    const out = s.output['r1'];
+    const kept = out.chunks.filter((c) => c.stream === 'stdout').reduce((n, c) => n + c.data.length, 0);
+    expect(kept).toBeLessThanOrEqual(MAX_OUTPUT);
+    expect(out.dropped).toBe(true);
+    const r = shown(s);
+    expect(r.stdout_tail.length).toBeLessThanOrEqual(MAX_OUTPUT);
+    expect(r.stdout_tail.endsWith('END')).toBe(true);
+    expect(r.stderr_tail).toBe('err');
+    expect(r.truncated).toBe(true);
+    // Dropping old chunks is not a gap in the stream: no marker.
+    expect(r.stdout_tail).not.toContain(SKIP_MARKER);
+  });
+
+  it('keeps a single chunk larger than the cap and shows its tail', () => {
+    const s = feed(emptyState, chunk(1, 'y'.repeat(MAX_OUTPUT + 500) + 'END'));
+    expect(s.output['r1'].chunks).toHaveLength(1);
+    const r = shown(s);
+    expect(r.stdout_tail.length).toBe(MAX_OUTPUT);
+    expect(r.stdout_tail.endsWith('END')).toBe(true);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('inserts a marker for a skipped chunk', () => {
+    const s = feed(emptyState, chunk(1, 'before\n'), chunk(2, 'after\n', { skipped: true }));
+    const r = shown(s);
+    expect(r.stdout_tail).toBe('before\n' + SKIP_MARKER + 'after\n');
+    expect(r.truncated).toBe(true);
+  });
+
+  it('inserts a marker when events were lost in between', () => {
+    const s = feed(emptyState, chunk(1, 'a\n'), chunk(4, 'd\n'));
+    expect(shown(s).stdout_tail).toBe('a\n' + SKIP_MARKER + 'd\n');
+  });
+
+  it('continues from the tail a page loaded mid-run, without repeating it', () => {
+    // The fetch returned output up to seq 2; chunks 1 and 2 also arrived live.
+    const loaded: Run = { ...running, stdout_tail: 'one\ntwo\n', output_seq: 2 };
+    const s = feed(emptyState, chunk(1, 'one\n'), chunk(2, 'two\n'), chunk(3, 'three\n'));
+    expect(shown(s, loaded).stdout_tail).toBe('one\ntwo\nthree\n');
+    // Loaded at seq 2 but the first live chunk is 5: mark the hole.
+    const late = feed(emptyState, chunk(5, 'five\n'));
+    expect(shown(late, loaded).stdout_tail).toBe('one\ntwo\n' + SKIP_MARKER + 'five\n');
+  });
+
+  it('a running run event does not wipe streamed output; a finished one replaces it', () => {
+    let s = reduce(emptyState, { type: 'run', run: running });
+    s = feed(s, chunk(1, 'streamed\n'));
+    s = reduce(s, { type: 'run', run: { ...running } });
+    expect(shown(s, s.runs['dev1'][0]).stdout_tail).toBe('streamed\n');
+
+    const done: Run = { ...running, status: 'ok', exit_code: 0, stdout_tail: 'stored\n' };
+    s = reduce(s, { type: 'run', run: done });
+    expect(s.output['r1']).toBeUndefined();
+    expect(shown(s, s.runs['dev1'][0]).stdout_tail).toBe('stored\n');
+    // A stray late chunk cannot alter a finished run.
+    const after = feed(s, chunk(2, 'late\n'));
+    expect(after).toBe(s);
+  });
+
+  it('leaves a run with no streamed output alone', () => {
+    expect(liveRun(running, undefined)).toBe(running);
   });
 });

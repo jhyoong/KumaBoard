@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/jhyoong/KumaBoard/proto"
 	"github.com/jhyoong/KumaBoard/server/hub"
 	"github.com/jhyoong/KumaBoard/server/store"
 )
@@ -12,6 +13,47 @@ func (s *server) mountRuns(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/devices/{name}/commands/{cmd}", s.runCommand)
 	mux.HandleFunc("GET /api/devices/{name}/runs", s.listRuns)
 	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
+	mux.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
+}
+
+// overlayLive fills a run's output from the hub's in-flight buffers while
+// it is still running: nothing is stored until it finishes. A page opened
+// mid-run then starts from the current tail and follows run_output events
+// with a seq above OutputSeq.
+func (s *server) overlayLive(run *store.Run) {
+	if proto.IsTerminalRunStatus(run.Status) {
+		return
+	}
+	if stdout, stderr, truncated, seq, ok := s.Hub.LiveOutput(run.ID); ok {
+		run.StdoutTail, run.StderrTail, run.Truncated, run.OutputSeq = stdout, stderr, truncated, seq
+	}
+}
+
+// cancelRun asks the agent to stop a run. It carries nothing but the run ID
+// from the path; the body is not read.
+func (s *server) cancelRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.Store.GetRun(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		s.Log.Error("cancel run", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	err := s.Hub.CancelRun(r.Context(), id, s.actor(r))
+	switch {
+	case errors.Is(err, hub.ErrRunNotInFlight):
+		writeError(w, http.StatusConflict, "run is not in flight")
+	case errors.Is(err, hub.ErrCancelUnsupported):
+		writeError(w, http.StatusConflict, "agent does not support cancel; upgrade it to protocol 2")
+	case err != nil:
+		s.Log.Error("cancel run", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	default:
+		writeJSON(w, http.StatusAccepted, map[string]string{"run_id": id, "status": "cancel_sent"})
+	}
 }
 
 func (s *server) runCommand(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +84,9 @@ func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	for _, run := range runs {
+		s.overlayLive(run)
+	}
 	writeJSON(w, http.StatusOK, runs)
 }
 
@@ -56,5 +101,6 @@ func (s *server) getRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	s.overlayLive(run)
 	writeJSON(w, http.StatusOK, run)
 }

@@ -13,6 +13,22 @@ capabilities:
   - gpu
   - custom-commands
 
+# Commands are the buttons on the device page. They are defined here and only
+# here: the dashboard picks one by name and can never add arguments. The
+# agent re-reads this block within a few seconds of the file changing; the
+# rest of the file needs a service restart.
+#
+#   run:     argv array, never a shell string
+#   script:  absolute path of a script file. With run, it is appended as the
+#            last argument; alone, it is executed directly (shebang + x bit).
+#            Keep scripts in /opt/kuma-scripts (created by setup-agent.sh,
+#            owned by root): the agent refuses to offer or run a script that
+#            its own account could modify.
+#   confirm: true makes the dashboard ask before starting. It guards against
+#            misclicks only and is not a security control.
+#
+# Output is streamed to the dashboard while the command runs; only the last
+# 64 KiB per stream is kept. A script that needs a full log writes its own.
 commands:
   uptime:
     description: "Show system uptime"
@@ -25,3 +41,8 @@ commands:
     description: "Restart the llm-server LaunchDaemon"
     run: ["sudo", "-n", "/bin/launchctl", "kickstart", "-k", "system/local.llm-server"]
     timeout_s: 10
+  # backup-photos:
+  #   description: "Rsync photos to the NAS"
+  #   script: /opt/kuma-scripts/backup-photos.sh
+  #   timeout_s: 3600
+  #   confirm: true
