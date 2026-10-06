@@ -35,7 +35,7 @@ function Shell() {
   return (
     <div className="min-h-screen bg-canvas text-fg">
       <nav className="bg-surface border-b border-border px-4 py-3">
-        <div className="max-w-6xl mx-auto flex items-center justify-between">
+        <div className="max-w-6xl 2xl:max-w-[96rem] 3xl:max-w-[120rem] 4xl:max-w-[160rem] mx-auto flex items-center justify-between">
           <div className="flex items-center gap-6">
             <Link to="/" className="text-lg font-bold text-fg">KumaBoard</Link>
             <Link to="/" className="text-sm text-fg-muted hover:text-fg">Devices</Link>
@@ -55,15 +55,17 @@ function Shell() {
       </nav>
 
       {flash && (
-        <div className="max-w-6xl mx-auto mt-4 px-4">
-          <div className="rounded bg-info-soft p-3 text-sm text-info flex justify-between">
-            <span>{flash}</span>
-            <button onClick={() => setFlash('')} className="ml-4 text-info hover:text-fg">x</button>
+        <div className="max-w-6xl 2xl:max-w-[96rem] 3xl:max-w-[120rem] 4xl:max-w-[160rem] mx-auto mt-4 px-4">
+          <div className="2xl:mx-auto 2xl:max-w-3xl">
+            <div className="rounded bg-info-soft p-3 text-sm text-info flex justify-between">
+              <span>{flash}</span>
+              <button onClick={() => setFlash('')} className="ml-4 text-info hover:text-fg">x</button>
+            </div>
           </div>
         </div>
       )}
 
-      <main className="max-w-6xl mx-auto p-4">
+      <main className="max-w-6xl 2xl:max-w-[96rem] 3xl:max-w-[120rem] 4xl:max-w-[160rem] mx-auto p-4">
         <Routes>
           <Route path="/" element={<Devices state={state} live={live} onWake={wakeByName} />} />
           <Route path="/devices/:name" element={<DeviceDetail state={state} live={live} onWake={wakeByName} />} />

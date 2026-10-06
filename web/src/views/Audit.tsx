@@ -17,16 +17,17 @@ export function Audit() {
   }, [])
 
   return (
-    <div>
+    <div className="2xl:max-w-3xl">
       <h1 className="mb-4 text-2xl font-semibold">Audit log</h1>
       <table className="w-full text-left text-sm">
         <thead className="border-b border-border text-fg-subtle">
-          <tr><th className="py-1">Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr>
+          <tr><th className="py-1">Time</th><th className="hidden 2xl:table-cell 2xl:px-3">Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr>
         </thead>
         <tbody>
           {entries.map((e) => (
             <tr key={e.id} className="border-b border-border">
               <td className="py-1 whitespace-nowrap">{when(e.ts)}</td>
+              <td className="hidden 2xl:table-cell 2xl:px-3 2xl:whitespace-nowrap">{new Date(e.ts).toLocaleString()}</td>
               <td>{e.actor}</td>
               <td>{e.action}</td>
               <td className="font-mono">{e.target}</td>

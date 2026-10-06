@@ -58,6 +58,10 @@
   --color-chart-axis: #9ca3af;
   --color-chart-grid: #e5e7eb;
   --color-chart-fill: rgb(37 99 235 / 0.12);
+
+  /* Desktop-width tiers above Tailwind's 2xl (1536px). */
+  --breakpoint-3xl: 112rem; /* 1792px */
+  --breakpoint-4xl: 150rem; /* 2400px */
 }
 
 :root[data-theme="dark"] {
