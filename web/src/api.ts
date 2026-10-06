@@ -4,9 +4,13 @@ import { handleUnauthorized } from './auth';
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // The decoded JSON error body, when there was one. Some refusals carry
+  // more than the message (see RetryRefused, AbandonRefused).
+  body?: unknown;
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -23,11 +27,13 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     // A 401 on the login POST is a bad password, not an expired session.
     if (res.status === 401 && path !== '/api/login') handleUnauthorized();
     let msg = res.statusText;
+    let body: unknown;
     try {
-      const body = await res.json();
-      if (body.error) msg = body.error;
+      body = await res.json();
+      const err = (body as { error?: string } | null)?.error;
+      if (err) msg = err;
     } catch { /* ignore */ }
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, body);
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
@@ -37,6 +43,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 // up by device name; there is no wake-by-MAC route.
 export function wakePath(name: string): string {
   return `/api/devices/${encodeURIComponent(name)}/wake`;
+}
+
+// upgradesPath is the root of a device's upgrade routes.
+export function upgradesPath(name: string): string {
+  return `/api/devices/${encodeURIComponent(name)}/upgrades`;
 }
 
 // ---------- Types ----------
@@ -154,6 +165,36 @@ export interface Device {
   terminal_enabled: boolean;
   reject_reason: string;
   metrics: Metrics | null;
+  // Why the last upgrade evaluation did or did not send a request. null when
+  // there is nothing to report; absent from servers that predate it.
+  upgrade_dispatch?: UpgradeDispatch | null;
+  // Summary of the device's newest upgrade, without its detail text.
+  latest_upgrade?: LatestUpgrade | null;
+}
+
+// Outcome of the server's last attempt to offer this device its target
+// version. code is one of sent, in_flight, waiting, prev_failed, no_release,
+// not_connected, send_failed.
+export interface UpgradeDispatch {
+  code: string;
+  message: string;
+  // The device holding the fleet's one upgrade slot; '' unless in_flight.
+  blocking_device: string;
+  upgrade_id: string;
+  at: string;
+  // State and start time of the blocking upgrade, when the server sends them.
+  blocking_state?: string;
+  blocking_since?: string;
+}
+
+export interface LatestUpgrade {
+  id: string;
+  from_version: string;
+  to_version: string;
+  state: string;
+  failure_reason: string;
+  updated_at: string;
+  stalled: boolean;
 }
 
 export interface Run {
@@ -203,9 +244,59 @@ export interface UpgradeEntry {
   to_version: string;
   requested_by: string;
   started_at: string;
+  updated_at: string;
   finished_at: string | null;
   state: string;
   failure_reason: string;
+  // Free text from whoever closed the upgrade. When closed_by is "agent" it
+  // is untrusted: render it as text, never as markup.
+  failure_detail: string;
+  // agent | server | admin; '' while the upgrade is in flight.
+  closed_by: string;
+  // In flight with no report for longer than its state allows.
+  stalled: boolean;
+}
+
+// One line of an upgrade's timeline. applied is false for an event that was
+// recorded but did not change the upgrade (a late or superseded report).
+export interface UpgradeEvent {
+  ts: string;
+  source: string; // agent | server | admin
+  state: string;
+  reason: string;
+  detail: string;
+  applied: boolean;
+}
+
+// GET /api/devices/{name}/upgrades/{id}. Upgrades that predate the events
+// table have none.
+export interface UpgradeDetail extends UpgradeEntry {
+  events: UpgradeEvent[] | null;
+}
+
+// POST .../upgrades/retry: 202.
+export interface RetryAccepted {
+  status: string;
+  upgrade_id: string;
+}
+
+// POST .../upgrades/retry: 409, as ApiError.body. code is a dispatch code.
+export interface RetryRefused {
+  error: string;
+  code: string;
+  blocking_device?: string;
+}
+
+// POST .../upgrades/{id}/abandon: 200.
+export interface AbandonResult {
+  status: string;
+}
+
+// POST .../upgrades/{id}/abandon: 404 {error} or 409 {error, code:
+// "not_in_flight"}, as ApiError.body.
+export interface AbandonRefused {
+  error: string;
+  code?: string;
 }
 
 export interface ReleaseEntry {
@@ -213,4 +304,33 @@ export interface ReleaseEntry {
   os: string;
   arch: string;
   added_at: string;
+}
+
+// ---------- Upgrades ----------
+
+// The server defaults to 20 rows and caps at 100.
+export function listUpgrades(name: string, limit = 20): Promise<UpgradeEntry[]> {
+  return api<UpgradeEntry[]>(`${upgradesPath(name)}?limit=${limit}`);
+}
+
+export function getUpgrade(name: string, id: string): Promise<UpgradeDetail> {
+  return api<UpgradeDetail>(`${upgradesPath(name)}/${encodeURIComponent(id)}`);
+}
+
+export function retryUpgrade(name: string): Promise<RetryAccepted> {
+  return api<RetryAccepted>(`${upgradesPath(name)}/retry`, { method: 'POST' });
+}
+
+export function abandonUpgrade(name: string, id: string): Promise<AbandonResult> {
+  return api<AbandonResult>(`${upgradesPath(name)}/${encodeURIComponent(id)}/abandon`, { method: 'POST' });
+}
+
+// setDesiredVersion sets (or with '' clears) the target agent version. The
+// server evaluates the upgrade at once; the returned summary's
+// upgrade_dispatch says what came of it.
+export function setDesiredVersion(name: string, version: string): Promise<Device> {
+  return api<Device>(`/api/devices/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ desired_agent_version: version }),
+  });
 }

@@ -35,6 +35,22 @@ type RejectionHandler interface {
 	OnRejected(err error)
 }
 
+// ConnectFailureHandler is optionally implemented by a Handler that wants to
+// know why a connection attempt did not reach hello_ack. OnConnectFailed is
+// called on the Run goroutine before the client backs off and redials.
+type ConnectFailureHandler interface {
+	// stage is one of the ConnectStage constants. For ConnectStageRejected
+	// err is the same *HandshakeError that OnRejected receives.
+	OnConnectFailed(stage string, err error)
+}
+
+// Stages passed to ConnectFailureHandler.OnConnectFailed.
+const (
+	ConnectStageDial     = "dial"     // no connection: network, TLS, HTTP upgrade
+	ConnectStageHello    = "hello"    // connected, but no usable reply to hello
+	ConnectStageRejected = "rejected" // the server refused the handshake
+)
+
 // ErrAuthRejected matches (via errors.Is) a *HandshakeError caused by the
 // server no longer accepting this agent's credentials: an in-band auth_failed
 // or unknown_device reply to hello, or HTTP 401/403 on the upgrade request.
@@ -161,6 +177,7 @@ func (c *Client) runOnce(ctx context.Context) reason {
 			return reasonRejected
 		}
 		c.Log.Warn("dial failed", "url", c.URL, "err", err)
+		c.connectFailed(ConnectStageDial, err)
 		return reasonDialFailed
 	}
 	conn.SetReadLimit(proto.MaxMessageSize)
@@ -169,6 +186,7 @@ func (c *Client) runOnce(ctx context.Context) reason {
 
 	hello, _ := proto.New(proto.TypeHello, c.Hello())
 	if err := s.Send(hello); err != nil {
+		c.connectFailed(ConnectStageHello, fmt.Errorf("send hello: %w", err))
 		return reasonError
 	}
 	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -176,12 +194,14 @@ func (c *Client) runOnce(ctx context.Context) reason {
 	cancel()
 	if err != nil {
 		c.Log.Warn("no handshake response", "err", err)
+		c.connectFailed(ConnectStageHello, err)
 		return reasonError
 	}
 	var ack proto.HelloAck
 	switch resp.Type {
 	case proto.TypeHelloAck:
 		if err := resp.Unmarshal(&ack); err != nil {
+			c.connectFailed(ConnectStageHello, fmt.Errorf("decode hello_ack: %w", err))
 			return reasonError
 		}
 	case proto.TypeError:
@@ -191,6 +211,7 @@ func (c *Client) runOnce(ctx context.Context) reason {
 		c.rejected(&HandshakeError{Code: e.Code, Message: e.Message})
 		return reasonRejected
 	default:
+		c.connectFailed(ConnectStageHello, fmt.Errorf("unexpected reply %q to hello", resp.Type))
 		return reasonError
 	}
 	c.Backoff.Reset()
@@ -268,6 +289,13 @@ func statusOf(r *http.Response) int {
 func (c *Client) rejected(err *HandshakeError) {
 	if rh, ok := c.Handler.(RejectionHandler); ok {
 		rh.OnRejected(err)
+	}
+	c.connectFailed(ConnectStageRejected, err)
+}
+
+func (c *Client) connectFailed(stage string, err error) {
+	if fh, ok := c.Handler.(ConnectFailureHandler); ok {
+		fh.OnConnectFailed(stage, err)
 	}
 }
 

@@ -39,6 +39,15 @@ func (s *service) Execute(args []string, req <-chan svc.ChangeRequest, status ch
 	status <- svc.Status{State: svc.StartPending}
 	cfg, err := config.Load(s.cfgPath)
 	if err != nil {
+		// The log is normally opened after the config; open it here too so
+		// this failure, and a rollback it triggers, leave a trace.
+		log := slog.New(slog.DiscardHandler)
+		if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); ferr == nil {
+			defer f.Close()
+			log = slog.New(slog.NewTextHandler(f, nil))
+		}
+		log.Error("cannot load config", "path", s.cfgPath, "err", err)
+		rollbackFailedStartup(err, log)
 		return true, 1
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)

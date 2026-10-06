@@ -194,8 +194,10 @@ func (s *server) updateDevice(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.Store.Audit(r.Context(), actor, "set_desired_version", name, "ok", *body.DesiredAgentVersion)
-		d, _ := s.Store.GetDevice(r.Context(), name)
-		if d != nil {
+		// The hub records what came of the offer on the device, so the
+		// summary returned below says whether a request went out and, if
+		// not, why.
+		if d, _ := s.Store.GetDevice(r.Context(), name); d != nil {
 			s.tryUpgrade(r.Context(), d)
 		}
 	}

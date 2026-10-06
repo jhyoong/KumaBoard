@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jhyoong/KumaBoard/internal/buildinfo"
@@ -25,6 +26,17 @@ import (
 )
 
 type Sender func(proto.UpgradeResult) error
+
+// SelftestConfigStage is how a selftest child prefixes a config it rejects
+// ("error: selftest: config: ..."). The running agent matches it in the
+// child's stderr, so it must stay what released binaries print; a test in
+// cmd/kuma-agent pins it.
+const SelftestConfigStage = "selftest: config:"
+
+const (
+	downloadTimeout = 10 * time.Minute
+	selftestTimeout = 15 * time.Second
+)
 
 type Upgrader struct {
 	BinaryPath string
@@ -42,6 +54,12 @@ type Upgrader struct {
 	ConfigPath string
 
 	mu sync.Mutex
+	// running is the target version of the upgrade holding mu.
+	running atomic.Pointer[string]
+
+	// Zero means the default. Shortened in tests.
+	downloadTimeout time.Duration
+	selftestTimeout time.Duration
 }
 
 func New(binaryPath string, keys []ed25519.PublicKey, deviceName, token string, client *http.Client, log *slog.Logger) *Upgrader {
@@ -58,37 +76,73 @@ func New(binaryPath string, keys []ed25519.PublicKey, deviceName, token string, 
 	}
 }
 
+// Detail builds result detail text from parts the way every upgrade result
+// does: bearer token redacted, length bounded.
+func (u *Upgrader) Detail(parts ...string) string {
+	return buildDetail(u.Token, parts...)
+}
+
 func (u *Upgrader) HandleUpgradeRequest(req proto.UpgradeRequest, send Sender) {
+	from := buildinfo.Version
+	result := func(state, reason, detail string) proto.UpgradeResult {
+		return proto.UpgradeResult{
+			FromVersion: from, ToVersion: req.Version, State: state, Reason: reason,
+			UpgradeID: req.UpgradeID, Detail: buildDetail(u.Token, detail),
+		}
+	}
+
 	if !u.mu.TryLock() {
-		u.Log.Warn("upgrade already in progress, ignoring request")
+		detail := "upgrade already in progress"
+		if v := u.running.Load(); v != nil {
+			detail = fmt.Sprintf("upgrade to %s already in progress", *v)
+		}
+		u.Log.Warn("upgrade already in progress, refusing request", "to", req.Version)
+		// Not kept in the outbox: its one slot belongs to the running upgrade.
+		if err := send(result(proto.UpgradeFailed, proto.UpgradeReasonBusy, detail)); err != nil {
+			u.Log.Warn("upgrade: result not sent", "state", proto.UpgradeFailed, "err", err)
+		}
 		return
 	}
 	defer u.mu.Unlock()
+	u.running.Store(&req.Version)
+	defer u.running.Store(nil)
 
-	from := buildinfo.Version
-	report := func(state, reason string) {
-		send(proto.UpgradeResult{FromVersion: from, ToVersion: req.Version, State: state, Reason: reason})
+	// A failure that cannot be sent goes to the outbox for the next connect.
+	// Retrying here would hold the lock across a disconnect of unknown length.
+	report := func(state, reason, detail string) {
+		res := result(state, reason, detail)
+		err := send(res)
+		if err == nil {
+			return
+		}
+		u.Log.Warn("upgrade: result not sent", "state", state, "err", err)
+		if state != proto.UpgradeFailed {
+			return
+		}
+		if err := WriteOutbox(u.BinaryDir, res); err != nil {
+			u.Log.Error("upgrade: failed to keep result for the next connect", "err", err)
+		}
 	}
 
-	report(proto.UpgradeDownloading, "")
+	report(proto.UpgradeDownloading, "", "")
 	tmpPath, err := u.download(req.URL)
 	if err != nil {
 		u.Log.Error("upgrade download failed", "err", err)
-		report(proto.UpgradeFailed, proto.UpgradeReasonDownloadFailed)
+		report(proto.UpgradeFailed, proto.UpgradeReasonDownloadFailed, err.Error())
 		return
 	}
 
 	cleanup := func() { os.Remove(tmpPath) }
 
-	report(proto.UpgradeVerifying, "")
+	report(proto.UpgradeVerifying, "", "")
 	if err := u.verifyArtifact(tmpPath, req); err != nil {
 		u.Log.Error("upgrade verify failed", "err", err)
 		cleanup()
-		report(proto.UpgradeFailed, proto.UpgradeReasonVerifyFailed)
+		report(proto.UpgradeFailed, proto.UpgradeReasonVerifyFailed, buildDetail(u.Token, err.Error(), u.trustedKeys()))
 		return
 	}
 
-	report(proto.UpgradeSelftest, "")
+	report(proto.UpgradeSelftest, "", "")
 	if err := u.runSelftest(tmpPath); err != nil {
 		attrs := []any{"err", err, "binary", tmpPath}
 		var se *SelftestError
@@ -97,39 +151,72 @@ func (u *Upgrader) HandleUpgradeRequest(req proto.UpgradeRequest, send Sender) {
 		}
 		u.Log.Error("upgrade selftest failed", attrs...)
 		cleanup()
-		report(proto.UpgradeFailed, proto.UpgradeReasonSelftestFailed)
+		reason, detail := selftestFailure(u.Token, req.Version, err)
+		report(proto.UpgradeFailed, reason, detail)
 		return
 	}
 
 	if err := Swap(u.BinaryPath, tmpPath); err != nil {
 		u.Log.Error("upgrade swap failed", "err", err)
 		cleanup()
-		report(proto.UpgradeFailed, proto.UpgradeReasonSwapFailed)
+		report(proto.UpgradeFailed, proto.UpgradeReasonSwapFailed, err.Error())
 		return
 	}
-	report(proto.UpgradeSwapped, "")
 
+	// The marker is written after the swap, not before: a crash between a
+	// marker and the swap would look like a rollback. Without a marker the
+	// new binary would start with no probation, so the swap is undone.
 	marker := filepath.Join(u.BinaryDir, PendingFile)
-	WritePending(marker, &Pending{
+	if err := WritePending(marker, &Pending{
 		FromVersion: from,
 		ToVersion:   req.Version,
 		StartedAt:   time.Now().UTC(),
-	})
+		UpgradeID:   req.UpgradeID,
+	}); err != nil {
+		os.Remove(marker)
+		detail := fmt.Sprintf("write %s: %v; swap undone", PendingFile, err)
+		if rerr := RestoreOld(u.BinaryPath); rerr != nil {
+			detail = fmt.Sprintf("write %s: %v; undo failed: %v", PendingFile, err, rerr)
+		} else {
+			CleanupFailed(u.BinaryPath)
+		}
+		u.Log.Error("upgrade: pending marker not written", "detail", detail)
+		report(proto.UpgradeFailed, proto.UpgradeReasonSwapFailed, detail)
+		return
+	}
+	report(proto.UpgradeSwapped, "", "")
 
-	report(proto.UpgradeRestarting, "")
+	report(proto.UpgradeRestarting, "", "")
 	u.Log.Info("upgrade: restarting", "from", from, "to", req.Version)
 	if runtime.GOOS == "windows" {
-		os.Exit(1)
+		exit(1)
 	} else {
-		os.Exit(0)
+		exit(0)
 	}
 }
 
-func (u *Upgrader) download(url string) (string, error) {
-	if !strings.HasPrefix(url, "http") {
-		url = u.BaseURL + url
+// download fetches the artifact into a temp file beside the binary. It runs
+// under a deadline so a stalled transfer frees the upgrade lock. Its error
+// text is sent to the server as the failure detail.
+func (u *Upgrader) download(rawURL string) (string, error) {
+	timeout := u.downloadTimeout
+	if timeout == 0 {
+		timeout = downloadTimeout
 	}
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	path, err := u.fetch(ctx, rawURL)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "", fmt.Errorf("download timed out after %s", shortDuration(timeout))
+	}
+	return path, err
+}
+
+func (u *Upgrader) fetch(ctx context.Context, rawURL string) (string, error) {
+	if !strings.HasPrefix(rawURL, "http") {
+		rawURL = u.BaseURL + rawURL
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -146,7 +233,7 @@ func (u *Upgrader) download(url string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download: status %d", resp.StatusCode)
+		return "", fmt.Errorf("GET %s: status %d", req.URL.Path, resp.StatusCode)
 	}
 	tmp, err := os.CreateTemp(u.BinaryDir, tempPattern(runtime.GOOS))
 	if err != nil {
@@ -160,6 +247,21 @@ func (u *Upgrader) download(url string) (string, error) {
 	tmp.Close()
 	os.Chmod(tmp.Name(), 0o755)
 	return tmp.Name(), nil
+}
+
+// trustedKeys names the release keys compiled into this agent by the first
+// 8 hex characters of each public key, for a verify failure's detail.
+func (u *Upgrader) trustedKeys() string {
+	s := fmt.Sprintf("agent trusts %d release key(s)", len(u.Keys))
+	ids := make([]string, 0, len(u.Keys))
+	for _, k := range u.Keys {
+		h := hex.EncodeToString(k)
+		ids = append(ids, h[:min(len(h), 8)])
+	}
+	if len(ids) > 0 {
+		s += ": " + strings.Join(ids, ", ")
+	}
+	return s
 }
 
 func (u *Upgrader) verifyArtifact(path string, req proto.UpgradeRequest) error {
@@ -223,6 +325,12 @@ type SelftestError struct {
 	ExitCode int
 	Stdout   string
 	Stderr   string
+	// Started is false when the child could not be executed at all.
+	Started bool
+	// TimedOut is set when the child was killed at the Timeout deadline.
+	TimedOut bool
+	Timeout  time.Duration
+	Elapsed  time.Duration
 }
 
 func (e *SelftestError) Error() string {
@@ -240,7 +348,11 @@ func (u *Upgrader) Selftest(bin string) error {
 }
 
 func (u *Upgrader) runSelftest(binaryPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	timeout := u.selftestTimeout
+	if timeout == 0 {
+		timeout = selftestTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binaryPath, selftestArgs(u.ConfigPath)...)
 	// The child's output is captured rather than wired to os.Stderr: under
@@ -249,6 +361,7 @@ func (u *Upgrader) runSelftest(binaryPath string) error {
 	var stdout, stderr tailBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	start := time.Now()
 	err := cmd.Run()
 	os.Stderr.Write(stdout.buf)
 	os.Stderr.Write(stderr.buf)
@@ -258,9 +371,42 @@ func (u *Upgrader) runSelftest(binaryPath string) error {
 			ExitCode: cmd.ProcessState.ExitCode(),
 			Stdout:   strings.TrimSpace(string(stdout.buf)),
 			Stderr:   strings.TrimSpace(string(stderr.buf)),
+			Started:  cmd.ProcessState != nil,
+			TimedOut: ctx.Err() != nil,
+			Timeout:  timeout,
+			Elapsed:  time.Since(start),
 		}
 	}
 	return nil
+}
+
+// selftestFailure turns a runSelftest error into the reason and detail of
+// the failed result. The detail is the outcome line followed by the child's
+// output tails; a child that named the config stage gets its own reason.
+func selftestFailure(token, version string, err error) (reason, detail string) {
+	var se *SelftestError
+	if !errors.As(err, &se) {
+		return proto.UpgradeReasonSelftestFailed, buildDetail(token, fmt.Sprintf("selftest of %s: %v", version, err))
+	}
+	var outcome string
+	switch {
+	case se.TimedOut:
+		outcome = "timed out after " + shortDuration(se.Timeout)
+	case !se.Started:
+		outcome = fmt.Sprintf("did not start: %v", se.Err)
+	case se.ExitCode == -1:
+		outcome = fmt.Sprintf("was killed after %.1fs: %v", se.Elapsed.Seconds(), se.Err)
+	default:
+		outcome = fmt.Sprintf("exited %d after %.1fs", se.ExitCode, se.Elapsed.Seconds())
+	}
+	reason = proto.UpgradeReasonSelftestFailed
+	if strings.Contains(se.Stderr, SelftestConfigStage) {
+		reason = proto.UpgradeReasonSelftestConfigRejected
+	}
+	return reason, buildDetail(token,
+		fmt.Sprintf("selftest of %s %s", version, outcome),
+		"--- stderr (last 4 KiB) ---", se.Stderr,
+		"--- stdout (last 1 KiB) ---", tailBytes(se.Stdout, 1024))
 }
 
 // tailBuffer keeps the last few KiB written to it.

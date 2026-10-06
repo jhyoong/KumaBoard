@@ -9,6 +9,7 @@ import (
 
 	"github.com/jhyoong/KumaBoard/agent/transport"
 	"github.com/jhyoong/KumaBoard/proto"
+	"github.com/jhyoong/KumaBoard/server/store"
 )
 
 // messageRecorder wraps an agent handler to capture received envelopes
@@ -319,51 +320,120 @@ func TestRollbackDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Disconnect the temporary agent.
-	tmpAgent.cancel()
-	waitFor(t, 3*time.Second, func() bool { return !h.hub.Connected("rollback-a") })
-
-	// Clear any upgrade rows that might have been created during the first handshake,
-	// then create an in-flight upgrade in the "restarting" state.
-	// We mark any existing upgrade as failed first to prevent it from interfering.
-	existingUpgrade, _ := h.st.GetLatestUpgrade(ctx, d.ID)
-	if existingUpgrade != nil {
-		h.st.UpdateUpgradeState(ctx, existingUpgrade.ID, proto.UpgradeFailed, "test_cleanup")
+	// The first handshake offered the upgrade; the no-op agent left it at
+	// requested.
+	waitFor(t, 3*time.Second, func() bool {
+		u, _ := h.st.GetLatestUpgrade(ctx, d.ID)
+		return u != nil
+	})
+	first, err := h.st.GetLatestUpgrade(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
+	record := func(id, source, state, reason string) {
+		t.Helper()
+		applied, err := h.st.RecordUpgradeEvent(ctx, store.UpgradeEvent{UpgradeID: id, Source: source, State: state, Reason: reason})
+		if err != nil || !applied {
+			t.Fatalf("record %s on %s: applied=%v err=%v", state, id, applied, err)
+		}
+	}
+	// connect starts a no-op agent reporting version and returns it once the
+	// hub has registered it.
+	connect := func(version string) *agentHandle {
+		t.Helper()
+		a := h.startAgent(h.agentConfig("rollback-a", token), func(c *transport.Client) {
+			helloOverride(version, "linux", "amd64")(c)
+			c.Handler = &messageRecorder{}
+		})
+		waitFor(t, 3*time.Second, func() bool { return h.hub.Connected("rollback-a") })
+		return a
+	}
+	disconnect := func(a *agentHandle) {
+		t.Helper()
+		a.cancel()
+		waitFor(t, 3*time.Second, func() bool { return !h.hub.Connected("rollback-a") })
+	}
+	disconnect(tmpAgent)
 
+	// A reconnect at from_version before the swap is only a reconnect: the
+	// binary has not been replaced, so nothing was rolled back.
+	record(first.ID, store.UpgradeSourceAgent, proto.UpgradeDownloading, "")
+	agent := connect("0.3.0")
+	// Give the hub time to run checkUpgradeAfterHandshake.
+	time.Sleep(300 * time.Millisecond)
+	u, err := h.st.GetUpgrade(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.State != proto.UpgradeDownloading || u.FinishedAt != nil {
+		t.Fatalf("reconnect while downloading changed the upgrade: state=%q reason=%q finished=%v",
+			u.State, u.FailureReason, u.FinishedAt)
+	}
+	events, err := h.st.ListUpgradeEvents(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("reconnect while downloading added timeline events: %+v", events)
+	}
+	disconnect(agent)
+
+	// Close that attempt, then create one in the "restarting" state to
+	// simulate a mid-upgrade restart.
+	record(first.ID, store.UpgradeSourceServer, proto.UpgradeFailed, "test_cleanup")
 	upgradeID, err := h.st.CreateUpgrade(ctx, d.ID, "0.3.0", "0.4.0", "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Move to "restarting" state to simulate a mid-upgrade restart.
-	if err := h.st.UpdateUpgradeState(ctx, upgradeID, proto.UpgradeRestarting, ""); err != nil {
-		t.Fatal(err)
-	}
+	record(upgradeID, store.UpgradeSourceAgent, proto.UpgradeRestarting, "")
 
-	// Start a new agent reporting version "0.3.0" (same as from_version = rollback detected).
-	rec := &messageRecorder{}
-	cfg := h.agentConfig("rollback-a", token)
-	h.startAgent(cfg, func(c *transport.Client) {
-		helloOverride("0.3.0", "linux", "amd64")(c)
-		rec.inner = c.Handler
-		c.Handler = rec
-	})
-
-	// Wait for the upgrade row state to become "rolled_back".
+	// An agent reporting version "0.3.0" (from_version) after the swap means
+	// it rolled back.
+	agent = connect("0.3.0")
 	waitFor(t, 5*time.Second, func() bool {
 		u, _ := h.st.GetLatestUpgrade(ctx, d.ID)
 		return u != nil && u.State == proto.UpgradeRolledBack
 	})
 
-	u, err := h.st.GetLatestUpgrade(ctx, d.ID)
+	u, err = h.st.GetLatestUpgrade(ctx, d.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.State != proto.UpgradeRolledBack {
-		t.Fatalf("upgrade state = %q, want %q", u.State, proto.UpgradeRolledBack)
-	}
 	if u.ID != upgradeID {
 		t.Fatalf("rolled back wrong upgrade: got %s, want %s", u.ID, upgradeID)
+	}
+	if u.FailureReason != store.UpgradeReasonHandshakeAtFromVersion || u.ClosedBy != store.UpgradeSourceServer {
+		t.Fatalf("rolled back with reason=%q closed_by=%q, want %q by %q",
+			u.FailureReason, u.ClosedBy, store.UpgradeReasonHandshakeAtFromVersion, store.UpgradeSourceServer)
+	}
+	disconnect(agent)
+
+	// A handshake at to_version closes an upgrade stuck at restarting: the
+	// verified report was lost, but the agent is plainly running the target.
+	stuckID, err := h.st.CreateUpgrade(ctx, d.ID, "0.3.0", "0.4.0", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record(stuckID, store.UpgradeSourceAgent, proto.UpgradeRestarting, "")
+	connect("0.4.0")
+	waitFor(t, 5*time.Second, func() bool {
+		u, _ := h.st.GetUpgrade(ctx, stuckID)
+		return u != nil && u.State == proto.UpgradeVerified
+	})
+	u, err = h.st.GetUpgrade(ctx, stuckID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.FailureReason != store.UpgradeReasonHandshakeAtToVersion || u.ClosedBy != store.UpgradeSourceServer || u.FinishedAt == nil {
+		t.Fatalf("verified with reason=%q closed_by=%q finished=%v, want %q by %q",
+			u.FailureReason, u.ClosedBy, u.FinishedAt, store.UpgradeReasonHandshakeAtToVersion, store.UpgradeSourceServer)
+	}
+	if active, err := h.st.GetActiveUpgrade(ctx); err != nil || active != nil {
+		t.Fatalf("an upgrade still holds the slot: %+v (err %v)", active, err)
+	}
+	// The earlier rollback is history; the inference did not touch it.
+	if u, _ := h.st.GetUpgrade(ctx, upgradeID); u == nil || u.State != proto.UpgradeRolledBack {
+		t.Fatalf("earlier upgrade changed: %+v", u)
 	}
 }
 
@@ -404,7 +474,7 @@ func (h *harness) postRetry(name string) int {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	req.AddCookie(h.loginCookie())
+	req.AddCookie(h.session())
 	resp, err := h.srv.Client().Do(req)
 	if err != nil {
 		h.t.Fatal(err)
@@ -442,7 +512,7 @@ func TestUpgradeRetryAfterFailureDispatches(t *testing.T) {
 	}
 	waitFor(t, 5*time.Second, func() bool { return rec.countType(proto.TypeUpgradeRequest) == 2 })
 
-	ups, err := h.st.GetDeviceUpgrades(ctx, d.ID)
+	ups, err := h.st.GetDeviceUpgrades(ctx, d.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +565,7 @@ func TestUpgradeAutoOfferBlockedAfterFailure(t *testing.T) {
 	if rec2.hasType(proto.TypeUpgradeRequest) {
 		t.Fatal("auto-offered upgrade after a failed attempt without explicit retry")
 	}
-	ups, _ := h.st.GetDeviceUpgrades(ctx, d.ID)
+	ups, _ := h.st.GetDeviceUpgrades(ctx, d.ID, 0)
 	if len(ups) != 1 {
 		t.Fatalf("got %d upgrade rows, want 1", len(ups))
 	}

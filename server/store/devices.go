@@ -49,7 +49,10 @@ type Device struct {
 	// CommandsConfigError is why the agent's last config reload was rejected,
 	// as reported by the agent; empty when its commands are current.
 	CommandsConfigError string
-	CreatedAt           time.Time
+	// UpgradeDispatch is what came of the last upgrade evaluation; nil when
+	// there is nothing to report.
+	UpgradeDispatch *UpgradeDispatch
+	CreatedAt       time.Time
 }
 
 // GenerateToken returns a new 32-byte CSPRNG token and its SHA-256 hash.
@@ -70,18 +73,18 @@ func HashToken(plain string) []byte {
 
 const deviceCols = `id, name, mac, os, arch, token_hash, capabilities_json, schedule_json,
 	normally_off, terminal_enabled, last_seen, last_disconnect_at, last_reject_reason,
-	agent_version, desired_agent_version, protocol_version, commands_config_error, created_at`
+	agent_version, desired_agent_version, protocol_version, commands_config_error, upgrade_dispatch_json, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanDevice(row scanner) (*Device, error) {
 	var d Device
-	var caps, sched, created string
+	var caps, sched, dispatch, created string
 	var lastSeen, lastDisc sql.NullString
 	var normallyOff, terminalEnabled int
 	err := row.Scan(&d.ID, &d.Name, &d.MAC, &d.OS, &d.Arch, &d.TokenHash, &caps, &sched,
 		&normallyOff, &terminalEnabled, &lastSeen, &lastDisc, &d.LastRejectReason,
-		&d.AgentVersion, &d.DesiredAgentVersion, &d.ProtocolVersion, &d.CommandsConfigError, &created)
+		&d.AgentVersion, &d.DesiredAgentVersion, &d.ProtocolVersion, &d.CommandsConfigError, &dispatch, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -92,6 +95,12 @@ func scanDevice(row scanner) (*Device, error) {
 	_ = json.Unmarshal([]byte(sched), &d.Schedule)
 	if d.Capabilities == nil {
 		d.Capabilities = []string{}
+	}
+	if dispatch != "" {
+		var disp UpgradeDispatch
+		if json.Unmarshal([]byte(dispatch), &disp) == nil && disp.Code != "" {
+			d.UpgradeDispatch = &disp
+		}
 	}
 	d.NormallyOff = normallyOff == 1
 	d.TerminalEnabled = terminalEnabled == 1

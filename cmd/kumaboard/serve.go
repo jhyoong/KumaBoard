@@ -96,10 +96,24 @@ func runServe(args []string) error {
 		}
 	}()
 
-	handler, err := buildHandler(cfg, st, log)
+	handler, h, err := buildHandler(cfg, st, log)
 	if err != nil {
 		return err
 	}
+	go func() {
+		// Upgrades that stopped reporting: timed out before the swap,
+		// flagged as stalled after it.
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				h.SweepUpgrades(ctx, now)
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Handler:           handler,
@@ -132,11 +146,11 @@ func runServe(args []string) error {
 	return srv.Shutdown(shutCtx)
 }
 
-func buildHandler(cfg *config.Config, st *store.Store, log *slog.Logger) (http.Handler, error) {
+func buildHandler(cfg *config.Config, st *store.Store, log *slog.Logger) (http.Handler, *hub.Hub, error) {
 	broker := sse.New()
 	reg := registry.New(st, broker, time.Duration(cfg.MetricsIntervalS)*time.Second)
 	if err := reg.Load(context.Background()); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	go reg.Run(context.Background())
 
@@ -174,7 +188,7 @@ func buildHandler(cfg *config.Config, st *store.Store, log *slog.Logger) (http.H
 	mux.Handle("GET /ws/terminal", auth.OriginCheck(allowed)(termBroker))
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/", api.Static())
-	return auth.HostCheck(allowed)(mux), nil
+	return auth.HostCheck(allowed)(mux), h, nil
 }
 
 func runPasswd(args []string) error {
