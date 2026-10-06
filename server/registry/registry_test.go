@@ -85,3 +85,40 @@ func TestSummaryFlagsIncompatible(t *testing.T) {
 		t.Fatalf("expected incompatible flag: %+v", s)
 	}
 }
+
+func TestCommandEventsAndSummaryFields(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer st.Close()
+	ctx := context.Background()
+	d, _, _ := st.CreateDevice(ctx, "a", "", false, store.Schedule{})
+	pub := &capture{}
+	r := New(st, pub, 30*time.Second)
+	r.Load(ctx)
+
+	// Never null in JSON: the dashboard maps over both lists.
+	s, _ := r.Summary(ctx, "a")
+	if s.Commands == nil || s.CommandProblems == nil || s.CommandsConfigError != "" {
+		t.Fatalf("empty device: %+v", s)
+	}
+
+	st.ReplaceCommands(ctx, d.ID,
+		[]proto.CommandDef{{Name: "backup", TimeoutS: 60, Confirm: true}},
+		[]proto.CommandProblem{{Name: "wipe", Reason: "/opt/x is writable by the agent account"}}, "yaml: line 3")
+	r.CommandsChanged("a")
+	if pub.count("device") != 1 {
+		t.Fatalf("events: %v", pub.events)
+	}
+	s, _ = r.Summary(ctx, "a")
+	if len(s.Commands) != 1 || !s.Commands[0].Confirm || len(s.CommandProblems) != 1 || s.CommandProblems[0].Name != "wipe" || s.CommandsConfigError != "yaml: line 3" {
+		t.Fatalf("summary: %+v", s)
+	}
+	sums, _ := r.Summaries(ctx)
+	if len(sums) != 1 || len(sums[0].CommandProblems) != 1 {
+		t.Fatalf("summaries: %+v", sums)
+	}
+
+	r.RunOutput("run1", "a", 3, proto.CommandOutput{Stream: proto.StreamStdout, Data: "hi\n"})
+	if pub.count("run_output") != 1 {
+		t.Fatalf("events: %v", pub.events)
+	}
+}

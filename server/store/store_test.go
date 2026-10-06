@@ -23,7 +23,7 @@ func openTest(t *testing.T) *Store {
 func TestOpenCreatesSchema(t *testing.T) {
 	s := openTest(t)
 	want := []string{"devices", "commands", "command_runs", "terminal_sessions",
-		"audit_log", "users", "sessions", "wake_jobs", "agent_upgrades", "releases", "metrics_samples", "metrics_rollup"}
+		"audit_log", "users", "sessions", "wake_jobs", "agent_upgrades", "releases", "metrics_samples", "metrics_rollup", "command_problems"}
 	for _, table := range want {
 		var n int
 		err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n)
@@ -50,8 +50,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 	defer s2.Close()
 	var n int
-	if err := s2.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil || n != 5 {
-		t.Fatalf("migrations applied = %d err=%v, want 5", n, err)
+	if err := s2.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil || n != 6 {
+		t.Fatalf("migrations applied = %d err=%v, want 6", n, err)
 	}
 }
 
@@ -78,9 +78,13 @@ func TestMigrateTempFrom0004(t *testing.T) {
 		}
 		db.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, v+1, nowString())
 	}
-	old := &Store{db: db}
-	dev, _, err := old.CreateDevice(ctx, "deb", "", false, Schedule{})
+	// Raw SQL: Store methods expect the current schema, which this is not yet.
+	res, err := db.Exec(`INSERT INTO devices (name, created_at) VALUES ('deb', ?)`, nowString())
 	if err != nil {
+		t.Fatal(err)
+	}
+	var dev struct{ ID int64 }
+	if dev.ID, err = res.LastInsertId(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO metrics_samples (device_id, bucket, cpu_percent, mem_used_bytes, mem_total_bytes, disk_used_percent)
@@ -122,5 +126,72 @@ func TestMigrateTempFrom0004(t *testing.T) {
 	}
 	if hot, _ := s.MetricsHistory(ctx, "deb", time.Unix(1_800_000_030, 0)); len(hot) != 1 || hot[0].TempC == nil || *hot[0].TempC != 48 {
 		t.Fatalf("new sample = %+v", hot)
+	}
+}
+
+// TestMigrateCommandsFrom0005 opens a database left at schema 0005 and checks
+// 0006 is applied on the next Open, with pre-existing commands reading
+// confirm=false and no problems or config error.
+func TestMigrateCommandsFrom0005(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for v, name := range []string{"0001_init.sql", "0002_metrics_samples.sql", "0003_metrics_rollup.sql", "0004_metrics_gpu_mem.sql", "0005_metrics_temp.sql"} {
+		body, err := migrationFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(body)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		db.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, v+1, nowString())
+	}
+	res, err := db.Exec(`INSERT INTO devices (name, created_at) VALUES ('deb', ?)`, nowString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO commands (device_id, name, timeout_s, expect_disconnect, updated_at) VALUES (?, 'sleep', 15, 1, ?)`, id, nowString()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO command_runs (id, device_id, command, requested_by, requested_at, status) VALUES ('r1', ?, 'sleep', 'admin', ?, 'ok')`, id, nowString()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("0006 applied = %d err=%v", n, err)
+	}
+	cmds, err := s.ListCommands(ctx, id)
+	if err != nil || len(cmds) != 1 || cmds[0].Name != "sleep" || cmds[0].Confirm || !cmds[0].ExpectDisconnect {
+		t.Fatalf("old command = %+v err=%v", cmds, err)
+	}
+	if p, err := s.ListCommandProblems(ctx, id); err != nil || len(p) != 0 {
+		t.Fatalf("problems = %+v err=%v", p, err)
+	}
+	d, err := s.GetDevice(ctx, "deb")
+	if err != nil || d.CommandsConfigError != "" {
+		t.Fatalf("device = %+v err=%v", d, err)
+	}
+	// command_runs is untouched and takes the new free-text statuses.
+	if r, err := s.GetRun(ctx, "r1"); err != nil || r.Status != proto.RunOK {
+		t.Fatalf("old run = %+v err=%v", r, err)
+	}
+	s.InsertRun(ctx, &Run{ID: "r2", DeviceID: id, Command: "sleep", RequestedBy: "admin", RequestedAt: time.Now(), Status: proto.RunRunning})
+	s.FinishRun(ctx, "r2", proto.RunCancelled, nil, "", "", false)
+	if r, _ := s.GetRun(ctx, "r2"); r == nil || r.Status != proto.RunCancelled {
+		t.Fatalf("cancelled run = %+v", r)
 	}
 }

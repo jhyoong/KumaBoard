@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/jhyoong/KumaBoard/proto"
@@ -45,6 +46,9 @@ type Device struct {
 	AgentVersion        string
 	DesiredAgentVersion string
 	ProtocolVersion     int
+	// CommandsConfigError is why the agent's last config reload was rejected,
+	// as reported by the agent; empty when its commands are current.
+	CommandsConfigError string
 	CreatedAt           time.Time
 }
 
@@ -66,7 +70,7 @@ func HashToken(plain string) []byte {
 
 const deviceCols = `id, name, mac, os, arch, token_hash, capabilities_json, schedule_json,
 	normally_off, terminal_enabled, last_seen, last_disconnect_at, last_reject_reason,
-	agent_version, desired_agent_version, protocol_version, created_at`
+	agent_version, desired_agent_version, protocol_version, commands_config_error, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -77,7 +81,7 @@ func scanDevice(row scanner) (*Device, error) {
 	var normallyOff, terminalEnabled int
 	err := row.Scan(&d.ID, &d.Name, &d.MAC, &d.OS, &d.Arch, &d.TokenHash, &caps, &sched,
 		&normallyOff, &terminalEnabled, &lastSeen, &lastDisc, &d.LastRejectReason,
-		&d.AgentVersion, &d.DesiredAgentVersion, &d.ProtocolVersion, &created)
+		&d.AgentVersion, &d.DesiredAgentVersion, &d.ProtocolVersion, &d.CommandsConfigError, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -175,8 +179,10 @@ func (s *Store) RevokeToken(ctx context.Context, name string) error {
 	return nil
 }
 
-// RecordHandshake stores what the agent declared and refreshes its command list.
-func (s *Store) RecordHandshake(ctx context.Context, deviceID int64, osName, arch, agentVersion string, protocolVersion int, caps []string, cmds []proto.CommandDef) error {
+// RecordHandshake stores what the agent declared and refreshes its command
+// list. hello carries no config error, so any stored one is cleared; an agent
+// that still has one reports it again right after connecting.
+func (s *Store) RecordHandshake(ctx context.Context, deviceID int64, osName, arch, agentVersion string, protocolVersion int, caps []string, cmds []proto.CommandDef, problems []proto.CommandProblem) error {
 	if caps == nil {
 		caps = []string{}
 	}
@@ -186,30 +192,123 @@ func (s *Store) RecordHandshake(ctx context.Context, deviceID int64, osName, arc
 		return err
 	}
 	defer tx.Rollback()
-	now := nowString()
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE devices SET os = ?, arch = ?, agent_version = ?, protocol_version = ?, capabilities_json = ?,
 		 last_seen = ?, last_reject_reason = '' WHERE id = ?`,
-		osName, arch, agentVersion, protocolVersion, string(capsJSON), now, deviceID); err != nil {
+		osName, arch, agentVersion, protocolVersion, string(capsJSON), nowString(), deviceID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM commands WHERE device_id = ?`, deviceID); err != nil {
+	if _, err := replaceCommands(ctx, tx, deviceID, cmds, problems, ""); err != nil {
 		return err
-	}
-	for _, c := range cmds {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO commands (device_id, name, description, timeout_s, expect_disconnect, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			deviceID, c.Name, c.Description, c.TimeoutS, b2i(c.ExpectDisconnect), now); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
 
-// ListCommands returns the commands the device declared at its last handshake.
+// CommandsChange is what a ReplaceCommands call altered.
+type CommandsChange struct {
+	Added   []string // command names newly declared
+	Removed []string // command names no longer declared
+	// Changed is true if anything stored differs at all, including a
+	// description, the problem list or the config error.
+	Changed bool
+}
+
+// ReplaceCommands replaces a device's declared commands, withheld-command
+// problems and config error in one transaction. It is the command half of
+// RecordHandshake, used when an agent reloads its config while connected.
+func (s *Store) ReplaceCommands(ctx context.Context, deviceID int64, cmds []proto.CommandDef, problems []proto.CommandProblem, configError string) (CommandsChange, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CommandsChange{}, err
+	}
+	defer tx.Rollback()
+	ch, err := replaceCommands(ctx, tx, deviceID, cmds, problems, configError)
+	if err != nil {
+		return CommandsChange{}, err
+	}
+	return ch, tx.Commit()
+}
+
+func replaceCommands(ctx context.Context, tx *sql.Tx, deviceID int64, cmds []proto.CommandDef, problems []proto.CommandProblem, configError string) (CommandsChange, error) {
+	var ch CommandsChange
+	oldCmds, err := listCommands(ctx, tx, deviceID)
+	if err != nil {
+		return ch, err
+	}
+	oldProblems, err := listCommandProblems(ctx, tx, deviceID)
+	if err != nil {
+		return ch, err
+	}
+	var oldErr string
+	if err := tx.QueryRowContext(ctx, `SELECT commands_config_error FROM devices WHERE id = ?`, deviceID).Scan(&oldErr); err != nil {
+		return ch, err
+	}
+
+	now := nowString()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM commands WHERE device_id = ?`, deviceID); err != nil {
+		return ch, err
+	}
+	for _, c := range cmds {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO commands (device_id, name, description, timeout_s, expect_disconnect, confirm, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			deviceID, c.Name, c.Description, c.TimeoutS, b2i(c.ExpectDisconnect), b2i(c.Confirm), now); err != nil {
+			return ch, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM command_problems WHERE device_id = ?`, deviceID); err != nil {
+		return ch, err
+	}
+	for _, p := range problems {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO command_problems (device_id, name, reason) VALUES (?, ?, ?)`, deviceID, p.Name, p.Reason); err != nil {
+			return ch, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE devices SET commands_config_error = ? WHERE id = ?`, configError, deviceID); err != nil {
+		return ch, err
+	}
+
+	newCmds, err := listCommands(ctx, tx, deviceID)
+	if err != nil {
+		return ch, err
+	}
+	newProblems, err := listCommandProblems(ctx, tx, deviceID)
+	if err != nil {
+		return ch, err
+	}
+	had, has := map[string]bool{}, map[string]bool{}
+	for _, c := range oldCmds {
+		had[c.Name] = true
+	}
+	for _, c := range newCmds {
+		has[c.Name] = true
+		if !had[c.Name] {
+			ch.Added = append(ch.Added, c.Name)
+		}
+	}
+	for _, c := range oldCmds {
+		if !has[c.Name] {
+			ch.Removed = append(ch.Removed, c.Name)
+		}
+	}
+	ch.Changed = oldErr != configError || !slices.Equal(oldCmds, newCmds) || !slices.Equal(oldProblems, newProblems)
+	return ch, nil
+}
+
+// querier is the read half shared by *sql.DB and *sql.Tx.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// ListCommands returns the commands the device last declared, at its
+// handshake or in a later commands_update.
 func (s *Store) ListCommands(ctx context.Context, deviceID int64) ([]proto.CommandDef, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, description, timeout_s, expect_disconnect FROM commands WHERE device_id = ? ORDER BY name`, deviceID)
+	return listCommands(ctx, s.db, deviceID)
+}
+
+func listCommands(ctx context.Context, q querier, deviceID int64) ([]proto.CommandDef, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT name, description, timeout_s, expect_disconnect, confirm FROM commands WHERE device_id = ? ORDER BY name`, deviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -217,12 +316,37 @@ func (s *Store) ListCommands(ctx context.Context, deviceID int64) ([]proto.Comma
 	out := []proto.CommandDef{}
 	for rows.Next() {
 		var c proto.CommandDef
-		var ed int
-		if err := rows.Scan(&c.Name, &c.Description, &c.TimeoutS, &ed); err != nil {
+		var ed, confirm int
+		if err := rows.Scan(&c.Name, &c.Description, &c.TimeoutS, &ed, &confirm); err != nil {
 			return nil, err
 		}
 		c.ExpectDisconnect = ed == 1
+		c.Confirm = confirm == 1
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListCommandProblems returns the commands the device has in its config but
+// did not declare, with the agent's reason for each.
+func (s *Store) ListCommandProblems(ctx context.Context, deviceID int64) ([]proto.CommandProblem, error) {
+	return listCommandProblems(ctx, s.db, deviceID)
+}
+
+func listCommandProblems(ctx context.Context, q querier, deviceID int64) ([]proto.CommandProblem, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT name, reason FROM command_problems WHERE device_id = ? ORDER BY name`, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []proto.CommandProblem{}
+	for rows.Next() {
+		var p proto.CommandProblem
+		if err := rows.Scan(&p.Name, &p.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }

@@ -1,8 +1,10 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useNavigate, useParams, Link } from 'react-router'
-import { api, type GPU, type HistorySample, type Metrics, type MetricsHistory, type Run, type Schedule } from '../api'
-import type { State } from '../state'
+import { api, type CommandDef, type GPU, type HistorySample, type Metrics, type MetricsHistory, type Run, type Schedule } from '../api'
+import { liveRun, type State } from '../state'
+import { canStop, confirmRun, mergeRuns, runningRun } from '../commands'
 import type { LiveStatus } from '../live'
+import { DeviceRail } from '../components/DeviceRail'
 import { StateBadge } from '../components/StateBadge'
 import { RunList } from '../components/RunList'
 import { TimeSeriesChart } from '../components/TimeSeriesChart'
@@ -135,7 +137,7 @@ function MetricsCharts({ name, live }: { name: string; live: Metrics | null }) {
         <span className="text-xs text-fg-subtle">15-minute averages</span>
         {error && <span className="text-xs text-danger">{error}</span>}
       </div>
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 4xl:grid-cols-3">
         <TimeSeriesChart label="CPU %" values={s.cpu} color="var(--color-chart-1)" {...common} />
         <TimeSeriesChart label="Memory %" values={s.mem} color="var(--color-chart-2)" {...common} />
         <TimeSeriesChart label="Disk %" values={s.disk} color="var(--color-chart-3)" {...common} />
@@ -170,13 +172,6 @@ function MetricsCharts({ name, live }: { name: string; live: Metrics | null }) {
   )
 }
 
-function mergeRuns(live: Run[], fetched: Run[]): Run[] {
-  const byId = new Map<string, Run>()
-  for (const r of fetched) byId.set(r.id, r)
-  for (const r of live) byId.set(r.id, r)
-  return [...byId.values()].sort((a, b) => b.requested_at.localeCompare(a.requested_at))
-}
-
 export function DeviceDetail({ state, live, onWake }: { state: State; live: LiveStatus; onWake: (name: string) => void }) {
   const { name = '' } = useParams()
   const navigate = useNavigate()
@@ -193,14 +188,26 @@ export function DeviceDetail({ state, live, onWake }: { state: State; live: Live
     if (live.lastUpdate === null) return <p className="text-fg-subtle">Loading...</p>
     return <p className="text-fg-subtle">Unknown device.</p>
   }
-  const runs = mergeRuns(state.runs[name] ?? [], fetched)
+  // Runs still in flight show their streamed output as it arrives.
+  const runs = mergeRuns(state.runs[name] ?? [], fetched).map((r) => liveRun(r, state.output[r.id]))
+  const stoppable = canStop(device)
 
-  const run = async (cmd: string) => {
+  const run = async (c: CommandDef) => {
+    if (!confirmRun(name, c)) return
     try {
-      await api(`/api/devices/${name}/commands/${cmd}`, { method: 'POST' })
-      setMsg(`${cmd} requested`)
+      await api(`/api/devices/${name}/commands/${c.name}`, { method: 'POST' })
+      setMsg(`${c.name} requested`)
     } catch (e) {
-      setMsg(`${cmd}: ${(e as Error).message}`)
+      setMsg(`${c.name}: ${(e as Error).message}`)
+    }
+  }
+
+  const stop = async (r: Run) => {
+    try {
+      await api(`/api/runs/${r.id}/cancel`, { method: 'POST' })
+      setMsg(`${r.command}: stop requested`)
+    } catch (e) {
+      setMsg(`${r.command}: ${(e as Error).message}`)
     }
   }
 
@@ -215,65 +222,96 @@ export function DeviceDetail({ state, live, onWake }: { state: State; live: Live
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <h1 className="text-2xl font-semibold">{device.name}</h1>
-        <StateBadge state={device.state} />
-        <span className="text-sm text-fg-subtle">{device.os}/{device.arch} · agent {device.agent_version || '?'} · proto {device.protocol_version || '?'} · last seen {when(device.last_seen)}</span>
-      </div>
-      {device.incompatible && <div className="rounded bg-danger-soft p-2 text-sm text-danger">Incompatible agent, needs redeploy</div>}
-
-      <section>
-        <h2 className="mb-2 font-medium">Current metrics</h2>
-        {device.metrics
-          ? <CurrentMetrics m={device.metrics} />
-          : <p className="text-sm text-fg-subtle">No live metrics{device.connected ? ' yet' : ' while disconnected'}.</p>}
-      </section>
-
-      <section>
-        <h2 className="mb-2 font-medium">History</h2>
-        <MetricsCharts name={name} live={device.connected ? device.metrics : null} />
-      </section>
-
-      <section>
-        <h2 className="mb-2 font-medium">Commands</h2>
-        <div className="flex flex-wrap gap-2">
-          {device.capabilities.includes('wol-target') && (
-            <button className="rounded bg-accent px-3 py-1 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50" disabled={device.connected} onClick={() => onWake(name)}>Wake</button>
-          )}
-          {device.connected && device.capabilities.includes('terminal') && (
-            <Link
-              to={`/devices/${name}/terminal`}
-              className="rounded bg-neutral-action px-3 py-1 text-sm text-on-accent hover:bg-neutral-action-hover"
-            >
-              Terminal
-            </Link>
-          )}
-          {device.commands.map((c) => (
-            <button key={c.name} title={c.description} className="rounded border border-border-strong px-3 py-1 text-sm hover:bg-surface-muted disabled:opacity-50" disabled={!device.connected} onClick={() => run(c.name)}>
-              {c.name}
-            </button>
-          ))}
-          {device.commands.length === 0 && <span className="text-sm text-fg-subtle">No commands declared.</span>}
+    <div className="3xl:flex 3xl:items-start 3xl:gap-6">
+      <DeviceRail devices={Object.values(state.devices)} current={name} />
+      <div className="space-y-6 3xl:min-w-0 3xl:flex-1">
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold">{device.name}</h1>
+          <StateBadge state={device.state} />
+          <span className="text-sm text-fg-subtle">{device.os}/{device.arch} · agent {device.agent_version || '?'} · proto {device.protocol_version || '?'} · last seen {when(device.last_seen)}</span>
         </div>
-        {msg && <div className="mt-2 text-sm text-fg-muted">{msg}</div>}
-      </section>
+        {device.incompatible && <div className="rounded bg-danger-soft p-2 text-sm text-danger">Incompatible agent, needs redeploy</div>}
 
-      <section>
-        <h2 className="mb-2 font-medium">Agent upgrade</h2>
-        <UpgradePanel device={device} />
-      </section>
+        {/* One column below 2xl (the wrappers are display:contents, so order-*
+            fixes the sequence); from 2xl a fluid primary pane plus a sticky aside. */}
+        <div className="flex flex-col gap-6 2xl:flex-row 2xl:items-start">
+          <div className="contents 2xl:block 2xl:min-w-0 2xl:flex-1 2xl:space-y-6">
+            <section className="order-1">
+              <h2 className="mb-2 font-medium">Current metrics</h2>
+              {device.metrics
+                ? <CurrentMetrics m={device.metrics} />
+                : <p className="text-sm text-fg-subtle">No live metrics{device.connected ? ' yet' : ' while disconnected'}.</p>}
+            </section>
 
-      <section>
-        <h2 className="mb-2 font-medium">Run history</h2>
-        <RunList runs={runs} />
-      </section>
+            <section className="order-2">
+              <h2 className="mb-2 font-medium">History</h2>
+              <MetricsCharts name={name} live={device.connected ? device.metrics : null} />
+            </section>
 
-      <section className="max-w-lg">
-        <h2 className="mb-2 font-medium">Settings</h2>
-        <ScheduleEditor key={device.name + device.last_seen} device={device} onSave={save} />
-        <button className="mt-4 text-sm text-danger hover:underline" onClick={revoke}>Revoke token</button>
-      </section>
+            <section className="order-5">
+              <h2 className="mb-2 font-medium">Run history</h2>
+              <RunList runs={runs} onStop={stoppable ? stop : undefined} />
+            </section>
+          </div>
+
+          <aside className="contents 2xl:sticky 2xl:top-6 2xl:block 2xl:max-h-[calc(100vh-3rem)] 2xl:w-[26rem] 2xl:shrink-0 2xl:self-start 2xl:space-y-6 2xl:overflow-y-auto">
+            <section className="order-3">
+              <h2 className="mb-2 font-medium">Commands</h2>
+              <div className="flex flex-wrap gap-2">
+                {device.capabilities.includes('wol-target') && (
+                  <button className="rounded bg-accent px-3 py-1 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50" disabled={device.connected} onClick={() => onWake(name)}>Wake</button>
+                )}
+                {device.connected && device.capabilities.includes('terminal') && (
+                  <Link
+                    to={`/devices/${name}/terminal`}
+                    className="rounded bg-neutral-action px-3 py-1 text-sm text-on-accent hover:bg-neutral-action-hover"
+                  >
+                    Terminal
+                  </Link>
+                )}
+                {device.commands.map((c) => {
+                  const active = stoppable ? runningRun(runs, c.name) : undefined
+                  return (
+                    <span key={c.name} className="inline-flex">
+                      <button title={c.description} className={`rounded border border-border-strong px-3 py-1 text-sm hover:bg-surface-muted disabled:opacity-50 ${active ? 'rounded-r-none' : ''}`} disabled={!device.connected} onClick={() => run(c)}>
+                        {c.name}
+                      </button>
+                      {active && (
+                        <button title={`Stop ${c.name}`} className="rounded-r border border-l-0 border-danger px-2 py-1 text-sm text-danger hover:bg-danger-soft" onClick={() => stop(active)}>Stop</button>
+                      )}
+                    </span>
+                  )
+                })}
+                {device.commands.length === 0 && <span className="text-sm text-fg-subtle">No commands declared.</span>}
+              </div>
+              {msg && <div className="mt-2 text-sm text-fg-muted">{msg}</div>}
+              {device.commands_config_error && (
+                <div className="mt-2 rounded bg-danger-soft p-2 text-sm text-danger">
+                  The agent could not reload its config, so these are the commands from the last good one: {device.commands_config_error}
+                </div>
+              )}
+              {(device.command_problems ?? []).length > 0 && (
+                <ul className="mt-2 space-y-1 text-sm text-fg-muted">
+                  {(device.command_problems ?? []).map((p) => (
+                    <li key={p.name}><span className="font-mono">{p.name}</span> not available: {p.reason}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="order-4">
+              <h2 className="mb-2 font-medium">Agent upgrade</h2>
+              <UpgradePanel device={device} />
+            </section>
+
+            <section className="order-6 max-w-lg">
+              <h2 className="mb-2 font-medium">Settings</h2>
+              <ScheduleEditor key={device.name + device.last_seen} device={device} onSave={save} />
+              <button className="mt-4 text-sm text-danger hover:underline" onClick={revoke}>Revoke token</button>
+            </section>
+          </aside>
+        </div>
+      </div>
     </div>
   )
 }

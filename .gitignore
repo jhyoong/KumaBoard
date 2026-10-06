@@ -45,6 +45,7 @@ configs/dev-release.key
 
 # Docs containing personal/homelab data (device names, IPs, tokens guidance)
 docs/DEVICE-SETUP.md
+docs/DEPLOYED.md
 docs/TODO.md
 docs/phase0checklist.txt
 
@@ -59,3 +60,9 @@ deploy/hosts.local.mk
 
 # Local scratch files
 .scratch-*
+
+# Plan/design docs are kept local only
+docs/PLAN.md
+docs/PHASES.md
+docs/phase-*.md
+docs/plans/

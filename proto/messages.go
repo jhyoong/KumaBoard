@@ -2,6 +2,7 @@ package proto
 
 import (
 	"math"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,6 +18,8 @@ const (
 	TypeCommandRequest     = "command_request"
 	TypeCommandResult      = "command_result"
 	TypeCommandOutput      = "command_output"
+	TypeCommandCancel      = "command_cancel"
+	TypeCommandsUpdate     = "commands_update"
 	TypeTerminalOpen       = "terminal_open"
 	TypeTerminalOpenResult = "terminal_open_result"
 	TypeWolRequest         = "wol_request"
@@ -46,6 +49,10 @@ const (
 	RunDisconnectedAsExpected = "disconnected_as_expected"
 	RunNoDisconnect           = "no_disconnect"
 	RunLost                   = "lost"
+	// RunCancelled: stopped by command_cancel. RunRefused: the agent's file
+	// permission check failed immediately before exec. Both are v2.
+	RunCancelled = "cancelled"
+	RunRefused   = "refused"
 )
 
 // IsTerminalRunStatus reports whether a run status will not change again.
@@ -71,7 +78,73 @@ type CommandDef struct {
 	Description      string `json:"description"`
 	TimeoutS         int    `json:"timeout_s"`
 	ExpectDisconnect bool   `json:"expect_disconnect"`
+	// Confirm asks the dashboard to confirm before starting. It guards
+	// against misclicks only and is not a security control.
+	Confirm bool `json:"confirm"`
 }
+
+// CommandProblem is a command present in the agent's config but not declared
+// because the agent's own account could modify what it would execute.
+// Untrusted input.
+type CommandProblem struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+}
+
+// Sanitize limits for agent-supplied command declarations and output.
+const (
+	MaxCommands       = 64
+	MaxCommandTextLen = 256
+	// MaxCommandOutput is how much of each output stream is retained: the
+	// last 64 KiB, at the agent, the server and the dashboard.
+	MaxCommandOutput = 64 << 10
+)
+
+// nameRe matches the device and command name rule enforced by the agent
+// config and the dashboard API.
+var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// SanitizeCommands bounds an untrusted command list: entries with a bad or
+// repeated name are dropped, the list is capped at MaxCommands, descriptions
+// are truncated and a negative timeout becomes 0.
+func SanitizeCommands(in []CommandDef) []CommandDef {
+	out := make([]CommandDef, 0, min(len(in), MaxCommands))
+	seen := map[string]bool{}
+	for _, c := range in {
+		if len(out) == MaxCommands {
+			break
+		}
+		if !nameRe.MatchString(c.Name) || seen[c.Name] {
+			continue
+		}
+		seen[c.Name] = true
+		c.Description = truncateText(c.Description, MaxCommandTextLen)
+		c.TimeoutS = max(c.TimeoutS, 0)
+		out = append(out, c)
+	}
+	return out
+}
+
+// SanitizeProblems bounds an untrusted problem list the same way.
+func SanitizeProblems(in []CommandProblem) []CommandProblem {
+	out := make([]CommandProblem, 0, min(len(in), MaxCommands))
+	seen := map[string]bool{}
+	for _, p := range in {
+		if len(out) == MaxCommands {
+			break
+		}
+		if !nameRe.MatchString(p.Name) || seen[p.Name] {
+			continue
+		}
+		seen[p.Name] = true
+		p.Reason = truncateText(p.Reason, MaxCommandTextLen)
+		out = append(out, p)
+	}
+	return out
+}
+
+// SanitizeConfigError bounds an untrusted config_error string.
+func SanitizeConfigError(s string) string { return truncateText(s, MaxCommandTextLen) }
 
 // Hello is the agent's first message.
 type Hello struct {
@@ -83,6 +156,8 @@ type Hello struct {
 	Arch            string       `json:"arch"`
 	Capabilities    []string     `json:"capabilities"`
 	Commands        []CommandDef `json:"commands"`
+	// Problems lists commands withheld from Commands. Absent from v1 agents.
+	Problems []CommandProblem `json:"problems,omitempty"`
 }
 
 // Redacted returns a copy safe for logging and audit.
@@ -198,7 +273,23 @@ func truncateText(s string, n int) string {
 	return s[:n]
 }
 
-// CommandRequest names a command. Never a shell string.
+// TailText keeps at most the last n bytes of s without splitting a rune,
+// dropping invalid UTF-8 first. It is the front-trimming counterpart of
+// truncateText.
+func TailText(s string, n int) string {
+	s = strings.ToValidUTF8(s, "")
+	if len(s) <= n {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
+}
+
+// CommandRequest names a command. Never a shell string, and never anything
+// else: commands take no parameters, so this must stay a single field.
 type CommandRequest struct {
 	Name string `json:"name"`
 }
@@ -213,12 +304,31 @@ type CommandResult struct {
 	DurationMS int64  `json:"duration_ms"`
 }
 
-// CommandOutput is an optional streamed chunk. Defined in v1, not sent by the
-// v1 agent; the server accepts it.
+// CommandOutput is a streamed chunk; the envelope ID is the run ID. Defined
+// in v1 but only sent by v2 agents. Skipped means output before this chunk was
+// dropped because more than MaxCommandOutput arrived within one flush.
 type CommandOutput struct {
-	Seq    int    `json:"seq"`
-	Stream string `json:"stream"` // "stdout" or "stderr"
-	Data   string `json:"data"`
+	Seq     int    `json:"seq"`
+	Stream  string `json:"stream"` // "stdout" or "stderr"
+	Data    string `json:"data"`
+	Skipped bool   `json:"skipped,omitempty"`
+}
+
+// Output stream names carried by CommandOutput.
+const (
+	StreamStdout = "stdout"
+	StreamStderr = "stderr"
+)
+
+// CommandsUpdate replaces the device's declared commands after the agent
+// re-read its own config file. Sent by v2 agents only, never requested by the
+// server. ConfigError is set when the file could not be parsed and the
+// previous set was kept. command_cancel, the other v2 message, has no payload:
+// its envelope ID is the run ID.
+type CommandsUpdate struct {
+	Commands    []CommandDef     `json:"commands"`
+	Problems    []CommandProblem `json:"problems"`
+	ConfigError string           `json:"config_error"`
 }
 
 // Error is a coded error, usually followed by a close.

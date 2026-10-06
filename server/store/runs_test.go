@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jhyoong/KumaBoard/proto"
 )
@@ -69,5 +71,31 @@ func TestListRunsNewestFirst(t *testing.T) {
 	runs, err := s.ListRuns(ctx, d.ID, 2)
 	if err != nil || len(runs) != 2 || runs[0].ID != "c" {
 		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+}
+
+// The agent is untrusted: whatever it sends, only the last 64 KiB per stream
+// is stored.
+func TestFinishRunKeepsTail(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	d, _, _ := s.CreateDevice(ctx, "deb", "", false, Schedule{})
+	s.InsertRun(ctx, &Run{ID: "big", DeviceID: d.ID, Command: "x", RequestedBy: "u", RequestedAt: time.Now(), Status: proto.RunRunning})
+	huge := strings.Repeat("a", 3*proto.MaxCommandOutput) + "the end\n"
+	if err := s.FinishRun(ctx, "big", proto.RunOK, nil, huge, strings.Repeat("é", proto.MaxCommandOutput), false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetRun(ctx, "big")
+	if len(got.StdoutTail) != proto.MaxCommandOutput || !strings.HasSuffix(got.StdoutTail, "the end\n") {
+		t.Fatalf("stdout: %d bytes", len(got.StdoutTail))
+	}
+	if len(got.StderrTail) > proto.MaxCommandOutput || !utf8.ValidString(got.StderrTail) || !got.Truncated {
+		t.Fatalf("stderr: %d bytes, truncated %v", len(got.StderrTail), got.Truncated)
+	}
+
+	s.InsertRun(ctx, &Run{ID: "small", DeviceID: d.ID, Command: "x", RequestedBy: "u", RequestedAt: time.Now(), Status: proto.RunRunning})
+	s.FinishRun(ctx, "small", proto.RunOK, nil, "out", "err", false)
+	if got, _ = s.GetRun(ctx, "small"); got.Truncated || got.StdoutTail != "out" || got.StderrTail != "err" {
+		t.Fatalf("small output altered: %+v", got)
 	}
 }

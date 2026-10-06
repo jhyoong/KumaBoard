@@ -26,7 +26,7 @@ export function Devices({ state, live, onWake }: Props) {
           {live.lastUpdate === null ? 'Loading devices...' : 'No devices registered yet.'}
         </p>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))]">
           {devices.map((d) => (
             <DeviceCard key={d.name} device={d} onWake={onWake} />
           ))}

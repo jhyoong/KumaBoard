@@ -6,7 +6,7 @@ import (
 )
 
 func TestSupported(t *testing.T) {
-	cases := map[int]bool{0: false, 1: true, 2: false}
+	cases := map[int]bool{0: false, 1: true, 2: true, 3: false}
 	for v, want := range cases {
 		if got := Supported(v); got != want {
 			t.Errorf("Supported(%d) = %v, want %v", v, got, want)

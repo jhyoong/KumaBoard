@@ -105,6 +105,16 @@ export interface CommandDef {
   description: string;
   timeout_s: number;
   expect_disconnect: boolean;
+  // Ask before starting. A misclick guard enforced here in the browser, not
+  // a security control. Absent from servers that predate it.
+  confirm?: boolean;
+}
+
+// A command in the agent's config that it did not declare, with its reason
+// (for example a script its own account could modify).
+export interface CommandProblem {
+  name: string;
+  reason: string;
 }
 
 export interface Window {
@@ -131,6 +141,10 @@ export interface Device {
   desired_agent_version: string;
   capabilities: string[];
   commands: CommandDef[];
+  // Both absent from servers that predate custom scripts.
+  command_problems?: CommandProblem[];
+  // Why the agent's last config reload was rejected; '' when current.
+  commands_config_error?: string;
   mac: string;
   normally_off: boolean;
   schedule: Schedule | null;
@@ -155,6 +169,21 @@ export interface Run {
   stdout_tail: string;
   stderr_tail: string;
   truncated: boolean;
+  // Only on a run still in flight whose tails came from the server's live
+  // buffers: the seq of the last run_output event they already include.
+  output_seq?: number;
+}
+
+// Payload of the "run_output" SSE event: one chunk of a running command's
+// output. seq counts from 1 per run. skipped means output before this chunk
+// was dropped.
+export interface RunOutput {
+  run_id: string;
+  device: string;
+  seq: number;
+  stream: 'stdout' | 'stderr';
+  data: string;
+  skipped: boolean;
 }
 
 export interface AuditEntry {

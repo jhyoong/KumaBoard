@@ -2,7 +2,7 @@
 // reconnect, a devices resync on every (re)connect, and a /api/devices poll
 // fallback that runs only while the stream is down.
 
-import type { Device, Metrics, Run } from './api';
+import type { Device, Metrics, Run, RunOutput } from './api';
 import type { SSEEvent } from './state';
 
 export const POLL_MS = 5000;
@@ -41,7 +41,8 @@ export function isStale(s: LiveStatus, now: number): boolean {
 }
 
 // parseEvent maps a named server SSE event to the reducer's event union. The
-// server sends bare payloads (Summary, MetricsEvent, Run) keyed by event name.
+// server sends bare payloads (Summary, MetricsEvent, Run, RunOutputEvent) keyed
+// by event name.
 export function parseEvent(name: string, data: string): SSEEvent | null {
   let v: unknown;
   try {
@@ -60,11 +61,20 @@ export function parseEvent(name: string, data: string): SSEEvent | null {
     }
     case 'run':
       return typeof (v as Run).id === 'string' ? { type: 'run', run: v as Run } : null;
+    case 'run_output': {
+      const o = v as Partial<RunOutput>;
+      if (typeof o.run_id !== 'string' || typeof o.device !== 'string' || typeof o.seq !== 'number'
+        || typeof o.data !== 'string' || (o.stream !== 'stdout' && o.stream !== 'stderr')) return null;
+      return {
+        type: 'run_output',
+        output: { run_id: o.run_id, device: o.device, seq: o.seq, stream: o.stream, data: o.data, skipped: o.skipped === true },
+      };
+    }
   }
   return null;
 }
 
-export const EVENT_NAMES = ['device', 'metrics', 'run'] as const;
+export const EVENT_NAMES = ['device', 'metrics', 'run', 'run_output'] as const;
 
 // StreamLike is the subset of EventSource LiveSync uses (injectable in tests).
 export interface StreamLike {

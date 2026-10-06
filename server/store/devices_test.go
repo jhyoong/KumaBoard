@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/subtle"
+	"slices"
 	"testing"
 	"time"
 
@@ -39,10 +40,10 @@ func TestRecordHandshakeReplacesCommands(t *testing.T) {
 	ctx := context.Background()
 	d, _, _ := s.CreateDevice(ctx, "deb", "", false, Schedule{})
 	cmds := []proto.CommandDef{{Name: "a", TimeoutS: 5}, {Name: "b", TimeoutS: 6, ExpectDisconnect: true}}
-	if err := s.RecordHandshake(ctx, d.ID, "linux", "amd64", "0.1.0", 1, []string{"metrics"}, cmds); err != nil {
+	if err := s.RecordHandshake(ctx, d.ID, "linux", "amd64", "0.1.0", 1, []string{"metrics"}, cmds, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordHandshake(ctx, d.ID, "linux", "amd64", "0.1.0", 1, []string{"metrics"}, cmds[1:]); err != nil {
+	if err := s.RecordHandshake(ctx, d.ID, "linux", "amd64", "0.1.0", 1, []string{"metrics"}, cmds[1:], nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.ListCommands(ctx, d.ID)
@@ -204,5 +205,60 @@ func TestSessionUsername(t *testing.T) {
 	}
 	if _, err := s.SessionUsername(ctx, "missing"); err != ErrNotFound {
 		t.Fatalf("missing session: %v", err)
+	}
+}
+
+func TestReplaceCommands(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	d, _, _ := s.CreateDevice(ctx, "deb", "", false, Schedule{})
+	first := []proto.CommandDef{{Name: "a", TimeoutS: 5}, {Name: "b", TimeoutS: 6, Confirm: true}}
+	ch, err := s.ReplaceCommands(ctx, d.ID, first, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ch.Changed || !slices.Equal(ch.Added, []string{"a", "b"}) || len(ch.Removed) != 0 {
+		t.Fatalf("first: %+v", ch)
+	}
+	got, _ := s.ListCommands(ctx, d.ID)
+	if len(got) != 2 || got[0].Confirm || !got[1].Confirm {
+		t.Fatalf("confirm not stored: %+v", got)
+	}
+
+	// Same again: nothing changed, so the caller can skip the audit row.
+	if ch, _ = s.ReplaceCommands(ctx, d.ID, first, nil, ""); ch.Changed || ch.Added != nil || ch.Removed != nil {
+		t.Fatalf("repeat: %+v", ch)
+	}
+
+	problems := []proto.CommandProblem{{Name: "b", Reason: "/opt/x is writable by the agent account"}}
+	ch, err = s.ReplaceCommands(ctx, d.ID, []proto.CommandDef{{Name: "a", TimeoutS: 5}, {Name: "c", TimeoutS: 1}}, problems, "yaml: line 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ch.Changed || !slices.Equal(ch.Added, []string{"c"}) || !slices.Equal(ch.Removed, []string{"b"}) {
+		t.Fatalf("second: %+v", ch)
+	}
+	gotP, err := s.ListCommandProblems(ctx, d.ID)
+	if err != nil || len(gotP) != 1 || gotP[0] != problems[0] {
+		t.Fatalf("problems: %+v %v", gotP, err)
+	}
+	if d2, _ := s.GetDevice(ctx, "deb"); d2.CommandsConfigError != "yaml: line 3" {
+		t.Fatalf("config error: %q", d2.CommandsConfigError)
+	}
+
+	// Only the description differs: changed, but nothing added or removed.
+	ch, _ = s.ReplaceCommands(ctx, d.ID, []proto.CommandDef{{Name: "a", Description: "x", TimeoutS: 5}, {Name: "c", TimeoutS: 1}}, problems, "yaml: line 3")
+	if !ch.Changed || ch.Added != nil || ch.Removed != nil {
+		t.Fatalf("description edit: %+v", ch)
+	}
+
+	// A handshake carries no config error and clears the stored one.
+	if err := s.RecordHandshake(ctx, d.ID, "linux", "amd64", "0.2.0", 2, nil, first, nil); err != nil {
+		t.Fatal(err)
+	}
+	d3, _ := s.GetDevice(ctx, "deb")
+	gotP, _ = s.ListCommandProblems(ctx, d.ID)
+	if d3.CommandsConfigError != "" || len(gotP) != 0 || d3.ProtocolVersion != 2 {
+		t.Fatalf("after handshake: err %q problems %+v", d3.CommandsConfigError, gotP)
 	}
 }

@@ -3,7 +3,7 @@
 package proto
 
 // Version is the protocol version this build speaks.
-const Version = 1
+const Version = 2
 
 // MinSupported is the oldest protocol version the server accepts.
 // The rule is N and N-1: MinSupported is never more than one behind Version.
