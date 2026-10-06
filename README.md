@@ -82,8 +82,7 @@ packaging, backup.
 Ed25519 release signing, artifact serving, agent selftest, download/verify/swap/restart
 cycle, 120-second probation with rollback, per-device upgrade control in the dashboard.
 
-Upcoming: Phase 3 (web terminal), Phase 4 (wake-run-sleep), and beyond. See
-`docs/PHASES.md` for the full roadmap.
+Upcoming: Phase 3 (web terminal), Phase 4 (wake-run-sleep), and beyond.
 
 ## Building
 

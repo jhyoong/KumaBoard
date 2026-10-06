@@ -72,7 +72,8 @@ KumaBoard: self-hosted control plane for a multi-OS homelab. One Go module
 
 ## Docs
 
-- `docs/PLAN.md` is the design source of truth; `docs/PHASES.md` indexes the
+- Plan docs are local-only (gitignored, not in the repo). When present,
+  `docs/PLAN.md` is the design source of truth; `docs/PHASES.md` indexes the
   ordered phase files. Phases run strictly in number order. README's
   "current status" lags the code — check `docs/` and `git log`, not README,
   for what is implemented.

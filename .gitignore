@@ -60,3 +60,9 @@ deploy/hosts.local.mk
 
 # Local scratch files
 .scratch-*
+
+# Plan/design docs are kept local only
+docs/PLAN.md
+docs/PHASES.md
+docs/phase-*.md
+docs/plans/
