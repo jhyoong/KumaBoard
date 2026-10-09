@@ -41,6 +41,23 @@ type Summary struct {
 	Incompatible        bool                   `json:"incompatible"`
 	RejectReason        string                 `json:"reject_reason"`
 	Metrics             *proto.Metrics         `json:"metrics"`
+	// UpgradeDispatch is what came of the last attempt to offer the device
+	// its desired version. LatestUpgrade is its newest upgrade, without the
+	// detail text. Both are null when there is nothing to report.
+	UpgradeDispatch *store.UpgradeDispatch `json:"upgrade_dispatch"`
+	LatestUpgrade   *LatestUpgrade         `json:"latest_upgrade"`
+}
+
+// LatestUpgrade is the part of a device's newest upgrade carried in its
+// Summary. Stalled is computed when the summary is built.
+type LatestUpgrade struct {
+	ID            string    `json:"id"`
+	FromVersion   string    `json:"from_version"`
+	ToVersion     string    `json:"to_version"`
+	State         string    `json:"state"`
+	FailureReason string    `json:"failure_reason"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Stalled       bool      `json:"stalled"`
 }
 
 // MetricsEvent is the payload of the "metrics" SSE event.
@@ -219,7 +236,19 @@ func (r *Registry) summariseDevice(ctx context.Context, d *store.Device) (*Summa
 	if err != nil {
 		return nil, err
 	}
-	return r.summarise(d, cmds, problems), nil
+	s := r.summarise(d, cmds, problems)
+	u, err := r.st.GetLatestUpgrade(ctx, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	if u != nil {
+		s.LatestUpgrade = &LatestUpgrade{
+			ID: u.ID, FromVersion: u.FromVersion, ToVersion: u.ToVersion,
+			State: u.State, FailureReason: u.FailureReason, UpdatedAt: u.UpdatedAt,
+			Stalled: u.IsStalled(r.now()),
+		}
+	}
+	return s, nil
 }
 
 // Summaries builds the dashboard view of every device.
@@ -252,6 +281,7 @@ func (r *Registry) summarise(d *store.Device, cmds []proto.CommandDef, problems 
 		LastSeen: d.LastSeen, LastDisconnectAt: d.LastDisconnectAt,
 		Incompatible: !e.connected && d.LastRejectReason == proto.ErrProtocolVersionUnsupported,
 		RejectReason: d.LastRejectReason, Metrics: e.ring.Latest(),
+		UpgradeDispatch: d.UpgradeDispatch,
 	}
 	r.mu.Unlock()
 	if s.Schedule.ExpectedOffline == nil {

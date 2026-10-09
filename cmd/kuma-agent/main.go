@@ -76,11 +76,12 @@ func runAgent(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	cfg, err := config.Load(*path)
 	if err != nil {
+		rollbackFailedStartup(err, log)
 		return err
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return runWithConfig(ctx, cfg, log)
@@ -114,6 +115,18 @@ func runSelftest(args []string) error {
 	}
 	fmt.Printf("kuma-agent %s protocol %d\n", buildinfo.Version, proto.Version)
 	return nil
+}
+
+// rollbackFailedStartup handles a startup error from before CheckStartup and
+// the probation timer exist: a freshly upgraded binary that cannot start
+// restores the previous one, so the service manager's restart does not loop
+// on this one forever. A binary that is not on probation is left alone.
+func rollbackFailedStartup(cause error, log *slog.Logger) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	upgrade.RollbackIfProbation(exe, proto.UpgradeReasonStartupFailed, cause.Error(), log)
 }
 
 // runWithConfig is shared by the foreground command and the Windows service.

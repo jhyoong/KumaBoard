@@ -4,8 +4,6 @@ package hub
 import (
 	"context"
 	"crypto/subtle"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -51,6 +49,10 @@ type Options struct {
 	// afterFunc schedules pong-deadline checks. Tests override it to fire
 	// deadlines deterministically; default wraps time.AfterFunc.
 	afterFunc func(time.Duration, func())
+
+	// now is the clock for upgrade dispatch records. Tests override it;
+	// default is time.Now.
+	now func() time.Time
 }
 
 // Hub accepts agent connections at /ws and tracks one session per device.
@@ -59,6 +61,10 @@ type Hub struct {
 	router   *router
 	mu       sync.Mutex
 	sessions map[string]*Session // by device name
+
+	// upgradeMu makes "nothing is in flight" and the insert of a new upgrade
+	// row one step, so concurrent evaluations cannot both take the fleet slot.
+	upgradeMu sync.Mutex
 }
 
 // New creates a Hub.
@@ -68,6 +74,9 @@ func New(opts Options) *Hub {
 	}
 	if opts.afterFunc == nil {
 		opts.afterFunc = func(d time.Duration, f func()) { time.AfterFunc(d, f) }
+	}
+	if opts.now == nil {
+		opts.now = time.Now
 	}
 	return &Hub{opts: opts, router: newRouter(), sessions: map[string]*Session{}}
 }
@@ -142,6 +151,7 @@ func (h *Hub) authenticate(ctx context.Context, hello *proto.Hello, remote strin
 	}
 	if !proto.Supported(hello.ProtocolVersion) {
 		st.RecordReject(ctx, d.Name, proto.ErrProtocolVersionUnsupported)
+		h.noteHandshakeRejected(ctx, d, hello)
 		st.Audit(ctx, "agent:"+d.Name, "handshake", d.Name, proto.ErrProtocolVersionUnsupported,
 			"agent protocol "+strconv.Itoa(hello.ProtocolVersion)+" version "+hello.AgentVersion)
 		return nil, proto.ErrProtocolVersionUnsupported
@@ -275,119 +285,4 @@ func (h *Hub) Session(name string) *Session {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.sessions[name]
-}
-
-func (h *Hub) handleUpgradeResult(ctx context.Context, s *Session, env *proto.Envelope) {
-	var res proto.UpgradeResult
-	if err := env.Unmarshal(&res); err != nil {
-		return
-	}
-	u, err := h.opts.Store.GetLatestUpgrade(ctx, s.DeviceID)
-	if err != nil || u == nil {
-		h.opts.Log.Warn("upgrade result for unknown upgrade", "device", s.DeviceName)
-		return
-	}
-	h.opts.Store.UpdateUpgradeState(ctx, u.ID, res.State, res.Reason)
-	h.opts.Store.Audit(ctx, "agent:"+s.DeviceName, "upgrade_state", s.DeviceName,
-		res.State, res.FromVersion+" -> "+res.ToVersion)
-	h.opts.Events.UpgradeChanged(s.DeviceName)
-}
-
-func (h *Hub) checkUpgradeAfterHandshake(ctx context.Context, s *Session, agentVersion string) {
-	d, err := h.opts.Store.GetDeviceByID(ctx, s.DeviceID)
-	if err != nil {
-		return
-	}
-	u, _ := h.opts.Store.GetLatestUpgrade(ctx, d.ID)
-	if u != nil && u.IsInFlight() && agentVersion == u.FromVersion {
-		h.opts.Store.UpdateUpgradeState(ctx, u.ID, proto.UpgradeRolledBack, "handshake_at_from_version")
-		h.opts.Store.Audit(ctx, "server", "upgrade_rollback_detected", d.Name, proto.UpgradeRolledBack, u.ID)
-		return
-	}
-	h.evaluateUpgrade(ctx, d, s, false)
-}
-
-// Reasons evaluateUpgrade may decline to send an upgrade request.
-var (
-	ErrUpgradeNotNeeded    = errors.New("no desired version set or device already at it")
-	ErrUpgradeInFlight     = errors.New("another upgrade is already in flight")
-	ErrUpgradePrevFailed   = errors.New("a previous upgrade to this version failed")
-	ErrUpgradeNoRelease    = errors.New("no release ingested for target version/os/arch")
-	ErrUpgradeNotConnected = errors.New("device is not connected")
-)
-
-// evaluateUpgrade sends d an upgrade request for its desired agent version and
-// returns nil only if the request was sent. When explicit is false (automatic
-// offers on handshake or on a desired-version change), a prior failed or
-// rolled_back attempt at the same target version blocks the offer so a bad
-// release is not retried in a loop. An explicit operator retry skips only
-// that check; the one-active-upgrade-in-fleet guard always applies.
-func (h *Hub) evaluateUpgrade(ctx context.Context, d *store.Device, s *Session, explicit bool) error {
-	if d.DesiredAgentVersion == "" || d.DesiredAgentVersion == d.AgentVersion {
-		return ErrUpgradeNotNeeded
-	}
-	active, err := h.opts.Store.GetActiveUpgrade(ctx)
-	if err != nil {
-		return fmt.Errorf("check active upgrade: %w", err)
-	}
-	if active != nil {
-		return ErrUpgradeInFlight
-	}
-	if !explicit && h.opts.Store.HasFailedUpgrade(ctx, d.ID, d.DesiredAgentVersion) {
-		return ErrUpgradePrevFailed
-	}
-	rel, err := h.opts.Store.GetRelease(ctx, d.DesiredAgentVersion, d.OS, d.Arch)
-	if err != nil {
-		h.opts.Log.Warn("no release for target version", "device", d.Name,
-			"version", d.DesiredAgentVersion, "os", d.OS, "arch", d.Arch)
-		if errors.Is(err, store.ErrNotFound) {
-			return ErrUpgradeNoRelease
-		}
-		return fmt.Errorf("get release: %w", err)
-	}
-	requestedBy := "server"
-	if explicit {
-		requestedBy = "admin"
-	}
-	id, err := h.opts.Store.CreateUpgrade(ctx, d.ID, d.AgentVersion, d.DesiredAgentVersion, requestedBy)
-	if err != nil {
-		h.opts.Log.Error("create upgrade row", "err", err)
-		return fmt.Errorf("create upgrade row: %w", err)
-	}
-	url := fmt.Sprintf("/api/agent/releases/%s/%s_%s", rel.Version, rel.OS, rel.Arch)
-	req := proto.UpgradeRequest{
-		Version: rel.Version, OS: rel.OS, Arch: rel.Arch,
-		SHA256: rel.SHA256, SizeBytes: rel.SizeBytes, Signature: rel.Signature,
-		URL: url,
-	}
-	env, _ := proto.New(proto.TypeUpgradeRequest, req)
-	if err := s.Send(env); err != nil {
-		h.opts.Log.Error("send upgrade request", "device", d.Name, "err", err)
-		// Close the row so it does not hold the fleet-wide in-flight slot.
-		h.opts.Store.UpdateUpgradeState(ctx, id, proto.UpgradeFailed, "send_failed")
-		return fmt.Errorf("send upgrade request: %w", err)
-	}
-	h.opts.Store.Audit(ctx, "server", "upgrade_request", d.Name, "sent", id)
-	h.opts.Log.Info("upgrade request sent", "device", d.Name, "to", d.DesiredAgentVersion)
-	return nil
-}
-
-// SendUpgradeToDevice triggers an automatic upgrade evaluation for a connected
-// device. It returns nil only if an upgrade request was sent.
-func (h *Hub) SendUpgradeToDevice(ctx context.Context, d *store.Device) error {
-	return h.sendUpgrade(ctx, d, false)
-}
-
-// RetryUpgrade is SendUpgradeToDevice for an explicit operator retry: it is
-// not blocked by an earlier failed or rolled_back attempt at the same version.
-func (h *Hub) RetryUpgrade(ctx context.Context, d *store.Device) error {
-	return h.sendUpgrade(ctx, d, true)
-}
-
-func (h *Hub) sendUpgrade(ctx context.Context, d *store.Device, explicit bool) error {
-	s := h.Session(d.Name)
-	if s == nil {
-		return ErrUpgradeNotConnected
-	}
-	return h.evaluateUpgrade(ctx, d, s, explicit)
 }

@@ -25,6 +25,7 @@ type env struct {
 	st     *store.Store
 	term   *terminal.Broker
 	reg    *registry.Registry
+	hub    *hub.Hub
 	client *http.Client
 }
 
@@ -58,7 +59,7 @@ func newEnvWake(t *testing.T, wake WakeFunc) *env {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	jar := &cookieJar{}
-	return &env{srv: srv, st: st, term: term, reg: reg, client: &http.Client{Jar: jar}}
+	return &env{srv: srv, st: st, term: term, reg: reg, hub: h, client: &http.Client{Jar: jar}}
 }
 
 func (e *env) do(t *testing.T, method, path string, body any) *http.Response {

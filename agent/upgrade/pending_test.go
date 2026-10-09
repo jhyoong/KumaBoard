@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,17 +43,82 @@ func TestPendingReadMissing(t *testing.T) {
 	}
 }
 
-func TestPendingSetReason(t *testing.T) {
+func TestPendingNewFieldsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), PendingFile)
+	p := &Pending{
+		FromVersion: "0.3.0", ToVersion: "0.4.0", StartedAt: time.Now().UTC().Truncate(time.Second),
+		RollbackReason: "no_handshake", UpgradeID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+		RollbackDetail: "no handshake within 2m0s\n12:00:03 dial: refused", Starts: 3,
+	}
+	if err := WritePending(path, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadPending(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.StartedAt.Equal(p.StartedAt) {
+		t.Fatalf("started_at = %v, want %v", got.StartedAt, p.StartedAt)
+	}
+	got.StartedAt = p.StartedAt
+	if *got != *p {
+		t.Fatalf("round trip: %+v, want %+v", got, p)
+	}
+}
+
+// The marker is written by one binary and read by the other: a file from a
+// binary without the new fields must decode, and so must one with fields
+// this binary has never heard of.
+func TestPendingOldAndNewerFormats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), PendingFile)
+	old := `{"from_version":"0.2.4","to_version":"0.2.5","started_at":"2026-10-06T12:00:00Z","rollback_reason":""}`
+	os.WriteFile(path, []byte(old), 0o644)
+	got, err := ReadPending(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FromVersion != "0.2.4" || got.ToVersion != "0.2.5" || got.StartedAt.IsZero() {
+		t.Fatalf("old format: %+v", got)
+	}
+	if got.UpgradeID != "" || got.RollbackDetail != "" || got.Starts != 0 {
+		t.Fatalf("old format grew values: %+v", got)
+	}
+
+	// A binary that does not set the new fields writes none of them.
+	if err := WritePending(path, got); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	for _, key := range []string{"upgrade_id", "rollback_detail", "starts"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("empty %s was written: %s", key, b)
+		}
+	}
+
+	newer := `{"from_version":"0.2.4","to_version":"0.2.5","started_at":"2026-10-06T12:00:00Z","rollback_reason":"x","upgrade_id":"U","from_the_future":{"a":1}}`
+	os.WriteFile(path, []byte(newer), 0o644)
+	if got, err := ReadPending(path); err != nil || got.UpgradeID != "U" {
+		t.Fatalf("newer format: %+v, %v", got, err)
+	}
+}
+
+func TestPendingSetRollback(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, PendingFile)
-	p := &Pending{FromVersion: "0.3.0", ToVersion: "0.4.0", StartedAt: time.Now().UTC()}
+	p := &Pending{FromVersion: "0.3.0", ToVersion: "0.4.0", StartedAt: time.Now().UTC(), UpgradeID: "U", Starts: 2}
 	WritePending(path, p)
-	if err := SetRollbackReason(path, "no_handshake"); err != nil {
+	if err := SetRollback(path, "no_handshake", "why"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := ReadPending(path)
-	if got.RollbackReason != "no_handshake" {
-		t.Fatalf("reason = %q", got.RollbackReason)
+	if got.RollbackReason != "no_handshake" || got.RollbackDetail != "why" {
+		t.Fatalf("reason = %q, detail = %q", got.RollbackReason, got.RollbackDetail)
+	}
+	if got.UpgradeID != "U" || got.Starts != 2 || got.ToVersion != "0.4.0" {
+		t.Fatalf("other fields lost: %+v", got)
+	}
+	if err := SetRollback(filepath.Join(dir, "absent.json"), "x", "y"); err == nil {
+		t.Fatal("missing marker reported no error")
 	}
 }
 

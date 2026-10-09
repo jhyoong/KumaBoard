@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,6 +41,14 @@ type App struct {
 	probationTimer *time.Timer
 	send           transport.Sender // current connection, nil while disconnected
 	watch          configWatch
+	// confirmed is set once a handshake has ended probation, even if the
+	// verified report is still to be delivered.
+	confirmed bool
+	// Why recent connection attempts failed: the last maxConnectFailures of
+	// them and how many there were in all. Memory only; a probation rollback
+	// reports them.
+	connectFailures     []connectFailure
+	connectFailureCount int
 
 	// Terminal sessions live under rootCtx, not the control connection, so a
 	// reconnect leaves them running. They end when their own socket closes,
@@ -49,6 +58,15 @@ type App struct {
 	termMu     sync.Mutex
 	terms      map[*liveTerminal]struct{}
 }
+
+// connectFailure is one failed connection attempt.
+type connectFailure struct {
+	at    time.Time
+	stage string
+	text  string
+}
+
+const maxConnectFailures = 5
 
 // liveTerminal is one registered terminal session.
 type liveTerminal struct {
@@ -90,9 +108,7 @@ func New(cfg *config.Config, log *slog.Logger, startupResult upgrade.StartupResu
 		Log: log,
 	})
 	if startupResult.State == upgrade.StateProbation {
-		a.probationTimer = time.AfterFunc(upgrade.ProbationTimeout, func() {
-			upgrade.Rollback(workDir, exe, startupResult.PendingMarker, log)
-		})
+		a.probationTimer = time.AfterFunc(upgrade.ProbationTimeout, a.probationExpired)
 	}
 	return a
 }
@@ -114,6 +130,15 @@ func parseKeys() []ed25519.PublicKey {
 // SetDispatchDelay overrides the delay before an expect_disconnect command
 // executes. Useful in tests.
 func (a *App) SetDispatchDelay(d time.Duration) { a.runner.DispatchDelay = d }
+
+// SetUpgradeBinaryPath points the upgrader at path instead of the running
+// executable: downloads, the swap, the pending marker and the outbox all use
+// path and its directory. Call before connecting. Useful in tests, where an
+// upgrade that reached the swap would otherwise replace the test binary.
+func (a *App) SetUpgradeBinaryPath(path string) {
+	a.upgrader.BinaryPath = path
+	a.upgrader.BinaryDir = filepath.Dir(path)
+}
 
 // SetCollector replaces the metrics collector. Call before connecting.
 // Useful in tests.
@@ -161,34 +186,106 @@ func (a *App) OnConnected(ack proto.HelloAck, send transport.Sender) {
 		go a.metricsLoop(ctx, interval, send)
 	}
 
+	sendResult := upgradeSender(send)
+	// A failure from before this connection that could not be sent then.
+	if sent, err := upgrade.FlushOutbox(a.upgrader.BinaryDir, sendResult); err != nil {
+		a.log.Warn("upgrade: kept result not delivered", "err", err)
+	} else if sent {
+		a.log.Info("upgrade: kept result delivered")
+	}
+
+	// Either report is retried on the next connect until Send accepts it.
 	switch a.startup.State {
 	case upgrade.StateProbation:
-		upgrade.ConfirmUpgrade(a.upgrader.BinaryDir, a.upgrader.BinaryPath, a.log)
-		if a.probationTimer != nil {
-			a.probationTimer.Stop()
+		// The handshake itself ends probation, delivered report or not.
+		if !a.confirmed {
+			a.confirmed = true
+			upgrade.ConfirmUpgrade(a.upgrader.BinaryDir, a.upgrader.BinaryPath, a.log)
+			if a.probationTimer != nil {
+				a.probationTimer.Stop()
+			}
 		}
-		res := proto.UpgradeResult{
-			FromVersion: a.startup.FromVersion,
-			ToVersion:   a.startup.ToVersion,
-			State:       proto.UpgradeVerified,
-		}
-		if e, err := proto.New(proto.TypeUpgradeResult, res); err == nil {
-			send.Send(e)
+		if err := sendResult(a.startupReport(proto.UpgradeVerified, "")); err != nil {
+			a.log.Warn("upgrade: verified report not sent", "err", err)
+			break
 		}
 		a.startup.State = upgrade.StateNormal
 	case upgrade.StateRolledBack:
-		res := proto.UpgradeResult{
-			FromVersion: a.startup.FromVersion,
-			ToVersion:   a.startup.ToVersion,
-			State:       proto.UpgradeRolledBack,
-			Reason:      a.startup.RollbackReason,
-		}
-		if e, err := proto.New(proto.TypeUpgradeResult, res); err == nil {
-			send.Send(e)
+		if err := sendResult(a.startupReport(proto.UpgradeRolledBack, a.startup.RollbackReason)); err != nil {
+			a.log.Warn("upgrade: rolled_back report not sent", "err", err)
+			break
 		}
 		os.Remove(a.startup.PendingMarker)
 		a.startup.State = upgrade.StateNormal
 	}
+}
+
+// startupReport is the result for the upgrade found by CheckStartup. The
+// detail comes from the marker, which the other binary wrote.
+func (a *App) startupReport(state, reason string) proto.UpgradeResult {
+	return proto.UpgradeResult{
+		FromVersion: a.startup.FromVersion,
+		ToVersion:   a.startup.ToVersion,
+		State:       state,
+		Reason:      reason,
+		UpgradeID:   a.startup.UpgradeID,
+		Detail:      a.upgrader.Detail(a.startup.RollbackDetail),
+	}
+}
+
+// upgradeSender wraps a connection as an upgrade.Sender.
+func upgradeSender(send transport.Sender) upgrade.Sender {
+	return func(res proto.UpgradeResult) error {
+		e, err := proto.New(proto.TypeUpgradeResult, res)
+		if err != nil {
+			return err
+		}
+		return send.Send(e)
+	}
+}
+
+// OnConnectFailed implements transport.ConnectFailureHandler.
+func (a *App) OnConnectFailed(stage string, err error) {
+	text := err.Error()
+	var he *transport.HandshakeError
+	if errors.As(err, &he) {
+		// The stage already says "rejected".
+		text = fmt.Sprintf("%s: %s", he.Code, he.Message)
+		if he.HTTPStatus != 0 {
+			text = fmt.Sprintf("HTTP %d", he.HTTPStatus)
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.connectFailureCount++
+	a.connectFailures = append(a.connectFailures, connectFailure{at: time.Now(), stage: stage, text: text})
+	if n := len(a.connectFailures); n > maxConnectFailures {
+		a.connectFailures = a.connectFailures[n-maxConnectFailures:]
+	}
+}
+
+// probationExpired runs when a new binary has not completed a handshake
+// within upgrade.ProbationTimeout. It rolls back and does not return.
+func (a *App) probationExpired() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// A handshake may have won the race with the timer.
+	if a.confirmed || a.startup.State != upgrade.StateProbation {
+		return
+	}
+	upgrade.Rollback(a.upgrader.BinaryDir, a.upgrader.BinaryPath, a.startup.PendingMarker,
+		proto.UpgradeReasonNoHandshake, a.probationDetail(), a.log)
+}
+
+// probationDetail says why the new binary is being rolled back: one summary
+// line, then the last connect failures (times in UTC). Callers hold a.mu.
+func (a *App) probationDetail() string {
+	lines := []string{fmt.Sprintf("no handshake within %s of starting %s (%d connect attempts)",
+		upgrade.ProbationTimeout, a.startup.ToVersion, a.connectFailureCount)}
+	for _, f := range a.connectFailures {
+		lines = append(lines, fmt.Sprintf("%s %s: %s", f.at.UTC().Format("15:04:05"), f.stage, f.text))
+	}
+	return a.upgrader.Detail(lines...)
 }
 
 // OnDisconnected stops per-connection work.
@@ -229,13 +326,7 @@ func (a *App) OnMessage(env *proto.Envelope, send transport.Sender) {
 		if err := env.Unmarshal(&req); err != nil {
 			return
 		}
-		go a.upgrader.HandleUpgradeRequest(req, func(res proto.UpgradeResult) error {
-			e, err := proto.New(proto.TypeUpgradeResult, res)
-			if err != nil {
-				return err
-			}
-			return send.Send(e)
-		})
+		go a.upgrader.HandleUpgradeRequest(req, upgradeSender(send))
 	case proto.TypeTerminalOpen:
 		var req proto.TerminalOpen
 		if err := env.Unmarshal(&req); err != nil {

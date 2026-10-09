@@ -3,7 +3,11 @@ package integration
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,6 +22,8 @@ import (
 	"github.com/jhyoong/KumaBoard/agent/config"
 	"github.com/jhyoong/KumaBoard/agent/transport"
 	"github.com/jhyoong/KumaBoard/agent/upgrade"
+	"github.com/jhyoong/KumaBoard/internal/buildinfo"
+	"github.com/jhyoong/KumaBoard/internal/signing"
 	"github.com/jhyoong/KumaBoard/proto"
 	"github.com/jhyoong/KumaBoard/server/api"
 	"github.com/jhyoong/KumaBoard/server/auth"
@@ -81,6 +87,11 @@ type harness struct {
 	srv    *httptest.Server
 	hubOpt hub.Options
 
+	// ReleasesDir is where the API serves agent artifacts from, laid out as
+	// <version>/<os>_<arch>/kuma-agent[.exe] like data_dir/releases.
+	ReleasesDir string
+	cookie      *http.Cookie // operator session, created on first use
+
 	sseBroker  *sse.Broker
 	registry   *registry.Registry
 	sessions   *auth.Sessions
@@ -118,7 +129,8 @@ func newHarnessWithTerminal(t *testing.T, termOpts terminal.Options) *harness {
 	ln.Close()
 	h := &harness{
 		t: t, dir: dir, st: st, events: &recorder{}, addr: addr, tlsCfg: tlsCfg,
-		log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		log:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		ReleasesDir: filepath.Join(dir, "releases"),
 	}
 	h.hubOpt = hub.Options{
 		Store: st, Events: h.events, Log: h.log,
@@ -143,6 +155,7 @@ func (h *harness) handler() http.Handler {
 		Store: h.st, Registry: h.registry, Hub: h.hub, Broker: h.sseBroker,
 		Sessions: h.sessions, Limiter: h.limiter, Terminal: h.termBroker,
 		AllowedHosts: map[string]bool{}, Log: h.log,
+		ReleasesDir: h.ReleasesDir,
 	})
 	mux.Handle("/api/", apiHandler)
 	return mux
@@ -169,6 +182,54 @@ func (h *harness) loginCookie() *http.Cookie {
 		h.t.Fatal(err)
 	}
 	return &http.Cookie{Name: auth.CookieName, Value: sid, Expires: exp}
+}
+
+// session returns one operator session cookie for the whole test.
+func (h *harness) session() *http.Cookie {
+	h.t.Helper()
+	if h.cookie == nil {
+		h.cookie = h.loginCookie()
+	}
+	return h.cookie
+}
+
+// useTestReleaseKey makes agents built after this call trust a fresh release
+// key, the way RELEASE_KEY_CURRENT does at build time, and returns the
+// private half for signing. The compiled-in value is restored at cleanup.
+func (h *harness) useTestReleaseKey() ed25519.PrivateKey {
+	h.t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	prev := buildinfo.ReleaseKeyCurrentHex
+	buildinfo.ReleaseKeyCurrentHex = hex.EncodeToString(pub)
+	h.t.Cleanup(func() { buildinfo.ReleaseKeyCurrentHex = prev })
+	return priv
+}
+
+// publishRelease does what "kumaboard sign" and "kumaboard release ingest"
+// do for one artifact: it puts the artifact under ReleasesDir where the
+// download endpoint looks for it, signs it with priv and ingests the release.
+func (h *harness) publishRelease(version, goos, goarch string, artifact []byte, priv ed25519.PrivateKey) {
+	h.t.Helper()
+	name := "kuma-agent"
+	if goos == "windows" {
+		name = "kuma-agent.exe"
+	}
+	dir := filepath.Join(h.ReleasesDir, version, goos+"_"+goarch)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), artifact, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifact)
+	hash := hex.EncodeToString(sum[:])
+	sig := base64.StdEncoding.EncodeToString(signing.Sign(priv, signing.BuildMessage(version, goos, goarch, hash)))
+	if err := h.st.IngestRelease(context.Background(), version, goos, goarch, hash, sig, int64(len(artifact))); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 func (h *harness) startServer() {
