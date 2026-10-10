@@ -5,6 +5,7 @@ package upgrade
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 func Swap(currentPath, tempPath string) error {
@@ -19,6 +20,7 @@ func Swap(currentPath, tempPath string) error {
 		os.Rename(oldPath, currentPath)
 		return fmt.Errorf("swap: rename new to current: %w", err)
 	}
+	syncDir(filepath.Dir(currentPath))
 	return nil
 }
 
@@ -27,7 +29,19 @@ func RestoreOld(currentPath string) error {
 	if err := os.Rename(oldPath, currentPath); err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
+	syncDir(filepath.Dir(currentPath))
 	return nil
+}
+
+// syncDir flushes a directory so a rename in it survives power loss. Best
+// effort: the rename has already happened.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
 }
 
 func CleanupFailed(currentPath string) {}

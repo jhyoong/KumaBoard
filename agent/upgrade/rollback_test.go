@@ -244,3 +244,48 @@ func TestRollbackSurvivesUnwritableMarker(t *testing.T) {
 	Rollback(dir, bin, marker, proto.UpgradeReasonNoHandshake, "why", slog.Default())
 	wantBinary(t, bin, "old-binary")
 }
+
+// No .old to restore (a manual redeploy after an earlier rollback): the
+// running binary must stay, the marker must go and the agent must not exit.
+func TestRollbackWithoutOldKeepsRunning(t *testing.T) {
+	code := stubExit(t)
+	dir, bin, marker := swappedDir(t)
+	os.Remove(bin + ".old")
+	Rollback(dir, bin, marker, proto.UpgradeReasonNoHandshake, "why", slog.Default())
+	if *code != -1 {
+		t.Fatalf("exited with %d, want no exit", *code)
+	}
+	wantBinary(t, bin, "new-binary")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(bin + ".failed"); !os.IsNotExist(err) {
+		t.Fatalf("no .failed should be left behind, stat err = %v", err)
+	}
+}
+
+// Past the start cap with no .old, the start that trips the crash loop must
+// run normally, and so must the one after it.
+func TestCheckStartupCrashLoopWithoutOld(t *testing.T) {
+	code := stubExit(t)
+	setVersion(t, "0.4.0")
+	dir, bin, marker := swappedDir(t)
+	os.Remove(bin + ".old")
+	p, _ := ReadPending(marker)
+	p.Starts = MaxProbationStarts
+	if err := WritePending(marker, p); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if res := checkStartup(dir, bin, slog.Default()); res.State != StateNormal {
+			t.Fatalf("start %d: State = %d, want StateNormal", i, res.State)
+		}
+		if *code != -1 {
+			t.Fatalf("start %d: exited with %d, want no exit", i, *code)
+		}
+		wantBinary(t, bin, "new-binary")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker should be removed, stat err = %v", err)
+	}
+}

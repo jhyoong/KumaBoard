@@ -77,8 +77,10 @@ func TestReconnectAfterServerRestart(t *testing.T) {
 	h.stopServer()
 	time.Sleep(1 * time.Second)
 	h.startServer()
-	waitFor(t, 5*time.Second, func() bool { return h.hub.Connected("a") })
-	if h.events.count("connect:a") < 2 {
+	// The hub registers the session before it emits the connect event, so
+	// wait for the event itself.
+	waitFor(t, 5*time.Second, func() bool { return h.events.count("connect:a") >= 2 })
+	if !h.hub.Connected("a") {
 		t.Fatal("agent did not reconnect after restart")
 	}
 }

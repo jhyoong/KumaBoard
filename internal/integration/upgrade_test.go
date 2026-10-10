@@ -474,6 +474,7 @@ func (h *harness) postRetry(name string) int {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(h.session())
 	resp, err := h.srv.Client().Do(req)
 	if err != nil {

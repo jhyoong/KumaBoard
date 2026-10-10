@@ -94,7 +94,8 @@ type devicePatchBody struct {
 }
 
 func (b *devicePatchBody) validate() error {
-	if b.MAC != nil && !macRe.MatchString(*b.MAC) {
+	// An empty MAC clears it, as it does at registration.
+	if b.MAC != nil && *b.MAC != "" && !macRe.MatchString(*b.MAC) {
 		return errors.New("mac must look like aa:bb:cc:dd:ee:ff")
 	}
 	if b.Schedule != nil {

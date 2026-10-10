@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jhyoong/KumaBoard/proto"
 )
@@ -293,5 +295,30 @@ func TestMigrateUpgradesFrom0006(t *testing.T) {
 	}
 	if u, _ := s.GetUpgrade(ctx, "u6"); u.State != proto.UpgradeVerified || u.ClosedBy != UpgradeSourceAgent || u.FinishedAt == nil {
 		t.Fatalf("old row after event = %+v", u)
+	}
+}
+
+func TestAuditBoundsFields(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	// The cut lands inside the last rune, which must be dropped whole.
+	long := strings.Repeat("a", maxAuditField-1) + "é" + strings.Repeat("b", 1<<20)
+	if err := st.Audit(ctx, long, "handshake", long, "ok", long); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := st.ListAudit(ctx, 1, 0)
+	if len(entries) != 1 {
+		t.Fatalf("%d entries", len(entries))
+	}
+	e := entries[0]
+	if len(e.Actor) != maxAuditField-1 || len(e.Target) != maxAuditField-1 || len(e.Detail) != maxAuditDetail {
+		t.Fatalf("actor %d, target %d, detail %d bytes", len(e.Actor), len(e.Target), len(e.Detail))
+	}
+	if !utf8.ValidString(e.Actor) {
+		t.Fatal("actor cut inside a UTF-8 sequence")
 	}
 }

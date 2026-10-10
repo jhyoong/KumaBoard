@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,5 +160,86 @@ func TestLogout(t *testing.T) {
 	e.do(t, "POST", "/api/logout", nil)
 	if resp := e.do(t, "GET", "/api/me", nil); resp.StatusCode != 401 {
 		t.Fatal("me after logout")
+	}
+}
+
+// doRaw sends a request with exactly the given headers, to stand in for a
+// page on another origin.
+func (e *env) doRaw(t *testing.T, method, path, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(method, e.srv.URL+path, strings.NewReader(body))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+// Every /api route refuses a foreign Origin, and state-changing routes
+// refuse a body a cross-origin form could send.
+func TestAPIRejectsCrossOriginAndNonJSON(t *testing.T) {
+	e := newEnv(t)
+	e.login(t)
+	ctx := context.Background()
+	if _, _, err := e.st.CreateDevice(ctx, "dev", "", false, store.Schedule{}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := map[string]string{"Content-Type": "application/json", "Origin": "https://127.0.0.1:9000"}
+	own := map[string]string{"Content-Type": "application/json; charset=utf-8", "Origin": "https://127.0.0.1"}
+
+	if resp := e.doRaw(t, "POST", "/api/devices/dev/revoke", "", foreign); resp.StatusCode != 403 {
+		t.Fatalf("foreign origin revoke: %d, want 403", resp.StatusCode)
+	}
+	if resp := e.doRaw(t, "POST", "/api/login", `{"username":"admin","password":"x"}`, foreign); resp.StatusCode != 403 {
+		t.Fatalf("foreign origin login: %d, want 403", resp.StatusCode)
+	}
+	if resp := e.doRaw(t, "GET", "/api/devices", "", foreign); resp.StatusCode != 403 {
+		t.Fatalf("foreign origin list: %d, want 403", resp.StatusCode)
+	}
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded"} {
+		h := map[string]string{}
+		if ct != "" {
+			h["Content-Type"] = ct
+		}
+		if resp := e.doRaw(t, "POST", "/api/devices/dev/revoke", "", h); resp.StatusCode != 415 {
+			t.Fatalf("content type %q: %d, want 415", ct, resp.StatusCode)
+		}
+	}
+	if d, _ := e.st.GetDevice(ctx, "dev"); d.TokenHash == nil {
+		t.Fatal("a refused request revoked the token")
+	}
+	if resp := e.doRaw(t, "GET", "/api/devices", "", nil); resp.StatusCode != 200 {
+		t.Fatalf("GET without content type: %d", resp.StatusCode)
+	}
+	if resp := e.doRaw(t, "POST", "/api/devices/dev/revoke", "", own); resp.StatusCode/100 != 2 {
+		t.Fatalf("own origin revoke: %d", resp.StatusCode)
+	}
+}
+
+// Logins sent in parallel are counted before they are hashed: only the
+// limiter's allowance reaches Argon2, the rest are refused outright.
+func TestLoginParallelAttemptsAreBounded(t *testing.T) {
+	e := newEnv(t)
+	var wg sync.WaitGroup
+	var unauthorized, limited atomic.Int32
+	for range 20 {
+		wg.Go(func() {
+			resp := e.do(t, "POST", "/api/login", map[string]string{"username": "admin", "password": "wrong"})
+			resp.Body.Close()
+			switch resp.StatusCode {
+			case 401:
+				unauthorized.Add(1)
+			case 429:
+				limited.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if unauthorized.Load() != 5 || limited.Load() != 15 {
+		t.Fatalf("401s = %d, 429s = %d; want 5 and 15", unauthorized.Load(), limited.Load())
 	}
 }

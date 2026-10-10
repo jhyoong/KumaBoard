@@ -92,6 +92,7 @@ func (h *harness) api(method, path string, body, out any) int {
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(h.session())
 	resp, err := h.srv.Client().Do(req)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -43,7 +44,29 @@ func WritePending(path string, p *Pending) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	// Temp file, fsync, rename: power loss must leave the old marker or the
+	// new one, never a truncated file the next start cannot parse.
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
 }
 
 // SetRollback records why the new binary is being rolled back. A missing

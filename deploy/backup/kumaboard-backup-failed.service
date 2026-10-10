@@ -1,0 +1,8 @@
+[Unit]
+Description=KumaBoard backup failure hook
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t kumaboard-backup "nightly backup failed; see: journalctl -u kumaboard-backup.service"
+# Optional operator hook (mail, ntfy, webhook). Skipped when absent.
+ExecStart=-/bin/sh -c '[ -x /etc/kumaboard/backup-failed.sh ] && exec /etc/kumaboard/backup-failed.sh'

@@ -26,10 +26,17 @@ export CGO_ENABLED=0
 
 all: test server agent-all
 
-test:
+# web/embed.go embeds web/dist, which is not committed, so anything that
+# compiles the server packages needs a dashboard build first. This builds one
+# only when none exists; `make web` always rebuilds.
+WEB_DIST := web/dist/index.html
+$(WEB_DIST):
+	cd web && npm ci && npm run build
+
+test: $(WEB_DIST)
 	go test ./...
 
-vet:
+vet: $(WEB_DIST)
 	go vet ./...
 
 fmt:

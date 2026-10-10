@@ -74,3 +74,19 @@ func TestRestoreFromOld(t *testing.T) {
 		t.Fatalf("current = %q", got)
 	}
 }
+
+func TestRestoreWithoutOldKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, agentBinaryName(runtime.GOOS))
+	os.WriteFile(current, []byte("running"), 0o755)
+
+	if err := RestoreOld(current); err == nil {
+		t.Fatal("RestoreOld succeeded with no .old")
+	}
+	if got, _ := os.ReadFile(current); string(got) != "running" {
+		t.Fatalf("current = %q", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("dir has %d entries, want 1", len(entries))
+	}
+}

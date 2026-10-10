@@ -265,7 +265,8 @@ func (a *App) OnConnectFailed(stage string, err error) {
 }
 
 // probationExpired runs when a new binary has not completed a handshake
-// within upgrade.ProbationTimeout. It rolls back and does not return.
+// within upgrade.ProbationTimeout. It rolls back, which exits unless there is
+// no previous binary to restore.
 func (a *App) probationExpired() {
 	a.mu.Lock()
 	defer a.mu.Unlock()

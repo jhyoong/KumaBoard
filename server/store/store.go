@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -128,12 +129,31 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
+// Bounds on audit_log columns. Several callers pass text that came from a
+// peer, so the limit is enforced here rather than at each call site.
+const (
+	maxAuditField  = 256
+	maxAuditDetail = 4096
+)
+
+// clip cuts s to at most max bytes without splitting a UTF-8 sequence.
+func clip(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
 // Audit appends one audit_log row. Never fails the caller's operation: errors
 // are returned so the caller can log them, but callers should not abort on them.
 func (s *Store) Audit(ctx context.Context, actor, action, target, result, detail string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO audit_log (ts, actor, action, target, result, detail) VALUES (?, ?, ?, ?, ?, ?)`,
-		nowString(), actor, action, target, result, detail)
+		nowString(), clip(actor, maxAuditField), clip(action, maxAuditField), clip(target, maxAuditField),
+		clip(result, maxAuditField), clip(detail, maxAuditDetail))
 	return err
 }
 

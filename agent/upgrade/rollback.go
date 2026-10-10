@@ -83,6 +83,7 @@ func checkStartup(binaryDir, binaryPath string, log *slog.Logger) StartupResult 
 		if p.Starts > MaxProbationStarts {
 			Rollback(binaryDir, binaryPath, markerPath, proto.UpgradeReasonCrashLoop,
 				fmt.Sprintf("started %d times without completing a handshake", p.Starts), log)
+			// Reached only when the previous binary could not be restored.
 			return StartupResult{State: StateNormal}
 		}
 		if err := WritePending(markerPath, p); err != nil {
@@ -120,9 +121,15 @@ func ConfirmUpgrade(binaryDir, binaryPath string, log *slog.Logger) {
 // back and exits so the service manager starts it. The previous binary is
 // restored even when the marker cannot be written; it then reports the
 // rollback without a cause.
+//
+// If the previous binary cannot be restored there is nothing to exit into, so
+// Rollback returns and this binary keeps running: a device with an unproven
+// agent is still reachable, one with no agent is not.
 func Rollback(binaryDir, binaryPath, markerPath, reason, detail string, log *slog.Logger) {
 	log.Error("upgrade: rolling back", "reason", reason, "detail", detail)
-	restore(binaryPath, markerPath, reason, detail, log)
+	if !restore(binaryPath, markerPath, reason, detail, log) {
+		return
+	}
 	exit(1)
 }
 
@@ -130,7 +137,8 @@ func Rollback(binaryDir, binaryPath, markerPath, reason, detail string, log *slo
 // exists and this binary is its to_version, the reason and detail are
 // recorded and the previous binary is restored. It reports whether this
 // binary was on probation. The caller is expected to exit; the service
-// manager then starts the restored binary.
+// manager then starts the restored binary, or this one again if there was no
+// previous binary to restore.
 func RollbackIfProbation(binaryPath, reason, detail string, log *slog.Logger) bool {
 	markerPath := filepath.Join(filepath.Dir(binaryPath), PendingFile)
 	p, err := ReadPending(markerPath)
@@ -146,14 +154,22 @@ func RollbackIfProbation(binaryPath, reason, detail string, log *slog.Logger) bo
 	return true
 }
 
-// restore is the part of a rollback that does not exit.
-func restore(binaryPath, markerPath, reason, detail string, log *slog.Logger) {
+// restore is the part of a rollback that does not exit. It reports whether
+// the previous binary is back in place. When it is not (typically no .old,
+// after a manual redeploy), the marker is removed: left behind, it would send
+// every later start down the same failed rollback.
+func restore(binaryPath, markerPath, reason, detail string, log *slog.Logger) bool {
 	if err := SetRollback(markerPath, reason, buildDetail("", detail)); err != nil {
 		log.Error("upgrade: failed to record rollback cause in marker", "err", err)
 	}
 	if err := RestoreOld(binaryPath); err != nil {
-		log.Error("upgrade: rollback failed", "err", err)
+		log.Error("upgrade: rollback failed, keeping the current binary", "err", err)
+		if err := os.RemoveAll(markerPath); err != nil {
+			log.Error("upgrade: failed to remove pending marker", "err", err)
+		}
+		return false
 	}
+	return true
 }
 
 const ProbationTimeout = 120 * time.Second

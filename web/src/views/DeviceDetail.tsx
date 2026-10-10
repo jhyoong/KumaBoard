@@ -306,7 +306,7 @@ export function DeviceDetail({ state, live, onWake }: { state: State; live: Live
 
             <section className="order-6 max-w-lg">
               <h2 className="mb-2 font-medium">Settings</h2>
-              <ScheduleEditor key={device.name + device.last_seen} device={device} onSave={save} />
+              <ScheduleEditor key={device.name} device={device} onSave={save} />
               <button className="mt-4 text-sm text-danger hover:underline" onClick={revoke}>Revoke token</button>
             </section>
           </aside>

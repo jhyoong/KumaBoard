@@ -69,7 +69,8 @@ func openResult(t *testing.T, send fakeSender, within time.Duration) (proto.Term
 }
 
 // terminalServer is a TLS stand-in for the control plane that counts every
-// request and accepts /ws/terminal after acceptDelay.
+// request and accepts /ws/terminal after acceptDelay. accepted carries the
+// time it began accepting.
 func terminalServer(t *testing.T, acceptDelay time.Duration) (srv *httptest.Server, hits *atomic.Int32, accepted chan time.Time, hellos chan proto.TerminalHello) {
 	t.Helper()
 	hits = &atomic.Int32{}
@@ -82,12 +83,15 @@ func terminalServer(t *testing.T, acceptDelay time.Duration) (srv *httptest.Serv
 			t.Errorf("terminal socket carried Authorization")
 		}
 		time.Sleep(acceptDelay)
+		// Taken before Accept: the client's dial can return, and its ok be
+		// sent, before this goroutine runs again after Accept.
+		at := time.Now()
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
-		accepted <- time.Now()
+		accepted <- at
 		_, data, err := c.Read(r.Context())
 		if err != nil {
 			return

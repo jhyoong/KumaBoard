@@ -350,3 +350,23 @@ func TestTerminalRefusalNotifiesBroker(t *testing.T) {
 	default:
 	}
 }
+
+// A hello from an unauthenticated peer can carry a name as large as the
+// message limit. It must be refused without being written to the audit log.
+func TestHandshakeMalformedNameNotAudited(t *testing.T) {
+	_, st, url := newTestHub(t, Options{})
+	for _, name := range []string{"", "Has Space", strings.Repeat("a", 64), strings.Repeat("a", 512<<10)} {
+		_, resp := dialHello(t, url, goodHello(name, "t"))
+		if c := errCode(t, resp); c != proto.ErrUnknownDevice {
+			t.Fatalf("name of %d bytes: got %s", len(name), c)
+		}
+	}
+	if entries, _ := st.ListAudit(context.Background(), 10, 0); len(entries) != 0 {
+		t.Fatalf("%d audit rows written for malformed names", len(entries))
+	}
+	// A well-formed unknown name is still audited.
+	dialHello(t, url, goodHello("nope", "t"))
+	if entries, _ := st.ListAudit(context.Background(), 10, 0); len(entries) != 1 {
+		t.Fatalf("unknown device: %d audit rows, want 1", len(entries))
+	}
+}

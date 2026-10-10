@@ -9,3 +9,5 @@ systemctl daemon-reload
 systemctl enable kumaboard
 echo "Copy the kumaboard binary to /opt/kumaboard/ and config to /etc/kumaboard/config.yaml, then: systemctl start kumaboard"
 echo "Then: sudo -u kumaboard /opt/kumaboard/kumaboard passwd -config /etc/kumaboard/config.yaml"
+echo "The release signing key (pki/release_ed25519) must stay root:root 0600; the kumaboard user must not read it."
+echo "Install the nightly backup with deploy/backup/install.sh (see deploy/backup/restore.md)."

@@ -1,6 +1,8 @@
 [Unit]
 Description=KumaBoard nightly backup
+OnFailure=kumaboard-backup-failed.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=/etc/kumaboard/backup.env
 ExecStart=/opt/kumaboard/backup.sh

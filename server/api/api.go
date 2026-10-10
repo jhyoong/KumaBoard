@@ -2,6 +2,7 @@ package api
 
 import (
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 
@@ -31,13 +32,18 @@ type Deps struct {
 	ReleasesDir  string
 }
 
+// maxPasswordHashes bounds concurrent Argon2id verifications. Each one
+// allocates 64 MiB, and /api/login is reachable without credentials.
+const maxPasswordHashes = 2
+
 type server struct {
 	Deps
+	hashSlots chan struct{}
 }
 
 // New builds the API handler tree.
 func New(d Deps) http.Handler {
-	s := &server{Deps: d}
+	s := &server{Deps: d, hashSlots: make(chan struct{}, maxPasswordHashes)}
 	authed := http.NewServeMux()
 	authed.HandleFunc("POST /api/logout", s.logout)
 	authed.HandleFunc("GET /api/me", s.me)
@@ -49,7 +55,7 @@ func New(d Deps) http.Handler {
 	authed.HandleFunc("GET /api/devices/{name}/metrics/history", s.deviceMetricsHistory)
 	authed.HandleFunc("GET /api/devices/{name}/commands", s.deviceCommands)
 	authed.HandleFunc("GET /api/audit", s.listAudit)
-	authed.Handle("GET /api/events", auth.OriginCheck(d.AllowedHosts)(d.Broker))
+	authed.Handle("GET /api/events", d.Broker)
 	s.mountRuns(authed)
 	s.mountWake(authed)
 	s.mountReleases(authed)
@@ -63,7 +69,26 @@ func New(d Deps) http.Handler {
 	root.HandleFunc("POST /api/login", s.login)
 	root.Handle("/api/agent/", auth.RequireDeviceToken(d.Store)(agentMux))
 	root.Handle("/api/", auth.RequireSession(d.Sessions)(authed))
-	return root
+	// The session cookie is SameSite=Strict, but "site" ignores the port, so
+	// another web UI on this host could otherwise drive the API. Checking
+	// Origin, and requiring a content type a cross-origin form cannot send,
+	// closes that. Agents send no Origin and only GET.
+	return auth.OriginCheck(d.AllowedHosts)(requireJSON(root))
+}
+
+// requireJSON rejects state-changing requests that are not declared as JSON.
+func requireJSON(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func clientIP(r *http.Request) string {

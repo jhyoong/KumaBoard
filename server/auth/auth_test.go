@@ -2,9 +2,12 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -123,5 +126,75 @@ func TestHostAndOriginChecks(t *testing.T) {
 	o.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("missing origin rejected: %d", rec.Code)
+	}
+}
+
+// Reserve counts the attempt up front, so attempts made in parallel cannot
+// all pass before any failure is recorded.
+func TestLimiterReserveBoundsParallelAttempts(t *testing.T) {
+	l := NewLimiter(5, time.Minute)
+	var wg sync.WaitGroup
+	var passed atomic.Int32
+	for range 100 {
+		wg.Go(func() {
+			if l.Reserve("1.2.3.4") {
+				passed.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if n := passed.Load(); n != 5 {
+		t.Fatalf("%d attempts passed, want 5", n)
+	}
+	if l.Allowed("1.2.3.4") {
+		t.Fatal("not locked after 5 reserved attempts")
+	}
+	// A success on the last allowed attempt clears the lockout it set.
+	l = NewLimiter(5, time.Minute)
+	for range 5 {
+		l.Reserve("1.2.3.4")
+	}
+	l.Reset("1.2.3.4")
+	if !l.Allowed("1.2.3.4") {
+		t.Fatal("reset did not clear the reserved attempts")
+	}
+}
+
+func TestLimiterFailuresDecay(t *testing.T) {
+	now := time.Now()
+	l := NewLimiter(5, time.Minute)
+	l.now = func() time.Time { return now }
+	for range 4 {
+		l.Fail("1.2.3.4")
+	}
+	now = now.Add(2 * time.Minute)
+	l.Fail("1.2.3.4")
+	if !l.Allowed("1.2.3.4") {
+		t.Fatal("failures older than the lockout window still counted")
+	}
+	now = now.Add(2 * time.Minute)
+	l.Sweep()
+	if len(l.entries) != 0 {
+		t.Fatalf("sweep left %d entries", len(l.entries))
+	}
+}
+
+func TestLimiterKeysIPv6BySlash64(t *testing.T) {
+	l := NewLimiter(5, time.Minute)
+	for i := range 5 {
+		l.Fail(fmt.Sprintf("2001:db8:1:2::%x", i+1))
+	}
+	if l.Allowed("2001:db8:1:2:ffff::1") {
+		t.Fatal("another address in the same /64 is not locked")
+	}
+	if !l.Allowed("2001:db8:1:3::1") {
+		t.Fatal("a different /64 is locked")
+	}
+	// An IPv4-mapped address is the IPv4 client, not a /64.
+	for range 5 {
+		l.Fail("::ffff:10.0.0.1")
+	}
+	if l.Allowed("10.0.0.1") || !l.Allowed("10.0.0.2") {
+		t.Fatal("IPv4-mapped address not keyed as its IPv4 address")
 	}
 }

@@ -239,12 +239,19 @@ func (u *Upgrader) fetch(ctx context.Context, rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
+	_, err = io.Copy(tmp, resp.Body)
+	if err == nil {
+		// Flushed before it can be renamed over the running binary: the
+		// rollback logic lives in this file, so it must not come up truncated.
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		os.Remove(tmp.Name())
 		return "", err
 	}
-	tmp.Close()
 	os.Chmod(tmp.Name(), 0o755)
 	return tmp.Name(), nil
 }

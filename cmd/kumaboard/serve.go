@@ -69,6 +69,7 @@ func runServe(args []string) error {
 		log.Info("marked in-flight runs lost at startup", "count", n)
 	}
 
+	limiter := auth.NewLimiter(5, time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -84,6 +85,7 @@ func runServe(args []string) error {
 				return
 			case <-t.C:
 				st.DeleteExpiredSessions(ctx)
+				limiter.Sweep()
 			case <-prune.C:
 				now := time.Now()
 				if err := st.RollupMetrics(ctx, now); err != nil {
@@ -96,7 +98,7 @@ func runServe(args []string) error {
 		}
 	}()
 
-	handler, h, err := buildHandler(cfg, st, log)
+	handler, h, err := buildHandler(cfg, st, limiter, log)
 	if err != nil {
 		return err
 	}
@@ -119,6 +121,10 @@ func runServe(args []string) error {
 		Handler:           handler,
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
+		// No ReadTimeout or WriteTimeout: either would cut SSE streams and
+		// WebSockets. Handlers that read a body from an unauthenticated
+		// client set their own read deadline.
+		IdleTimeout: 120 * time.Second,
 	}
 	errCh := make(chan error, len(cfg.ListenAddrs))
 	for _, addr := range cfg.ListenAddrs {
@@ -146,7 +152,7 @@ func runServe(args []string) error {
 	return srv.Shutdown(shutCtx)
 }
 
-func buildHandler(cfg *config.Config, st *store.Store, log *slog.Logger) (http.Handler, *hub.Hub, error) {
+func buildHandler(cfg *config.Config, st *store.Store, limiter *auth.Limiter, log *slog.Logger) (http.Handler, *hub.Hub, error) {
 	broker := sse.New()
 	reg := registry.New(st, broker, time.Duration(cfg.MetricsIntervalS)*time.Second)
 	if err := reg.Load(context.Background()); err != nil {
@@ -178,7 +184,7 @@ func buildHandler(cfg *config.Config, st *store.Store, log *slog.Logger) (http.H
 	allowed := cfg.AllowedHosts()
 	apiHandler := api.New(api.Deps{
 		Store: st, Registry: reg, Hub: h, Broker: broker,
-		Sessions: auth.NewSessions(st), Limiter: auth.NewLimiter(5, time.Minute),
+		Sessions: auth.NewSessions(st), Limiter: limiter,
 		Terminal: termBroker, AllowedHosts: allowed, Log: log, Wake: wakeFn,
 		ReleasesDir: filepath.Join(cfg.DataDir, "releases"),
 	})

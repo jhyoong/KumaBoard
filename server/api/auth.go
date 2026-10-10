@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/jhyoong/KumaBoard/server/auth"
 	"github.com/jhyoong/KumaBoard/server/store"
 	"github.com/jhyoong/KumaBoard/server/terminal"
 )
+
+const loginReadTimeout = 10 * time.Second
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
@@ -19,16 +23,25 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
+	// The server has no global read timeout (it would cut SSE and
+	// WebSockets), so a slow body is bounded here.
+	http.NewResponseController(w).SetReadDeadline(time.Now().Add(loginReadTimeout))
 	if err := readJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "bad request")
 		return
 	}
+	// The attempt is counted before the password is hashed, so requests sent
+	// in parallel cannot all get past the lockout.
+	if !s.Limiter.Reserve(ip) {
+		s.Store.Audit(r.Context(), ip, "login", "", "locked_out", "")
+		writeError(w, http.StatusTooManyRequests, "too many failed logins; try again later")
+		return
+	}
 	id, hash, err := s.Store.GetUser(r.Context(), body.Username)
-	if err != nil || !auth.VerifyPassword(body.Password, hash) {
+	if err != nil || !s.verifyPassword(r.Context(), body.Password, hash) {
 		if err != nil && err != store.ErrNotFound {
 			s.Log.Error("get user", "err", err)
 		}
-		s.Limiter.Fail(ip)
 		s.Store.Audit(r.Context(), ip, "login", body.Username, "failed", "")
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
@@ -42,6 +55,18 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	s.Store.Audit(r.Context(), body.Username, "login", body.Username, "ok", ip)
 	auth.SetCookie(w, sid, exp)
 	writeJSON(w, http.StatusOK, map[string]string{"username": body.Username})
+}
+
+// verifyPassword is auth.VerifyPassword behind the hashing bound. A request
+// that goes away while waiting for a slot is not hashed.
+func (s *server) verifyPassword(ctx context.Context, password, hash string) bool {
+	select {
+	case s.hashSlots <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	defer func() { <-s.hashSlots }()
+	return auth.VerifyPassword(password, hash)
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {

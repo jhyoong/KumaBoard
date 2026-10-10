@@ -104,6 +104,9 @@ const (
 // config and the dashboard API.
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// ValidName reports whether s is a well-formed device or command name.
+func ValidName(s string) bool { return nameRe.MatchString(s) }
+
 // SanitizeCommands bounds an untrusted command list: entries with a bad or
 // repeated name are dropped, the list is capped at MaxCommands, descriptions
 // are truncated and a negative timeout becomes 0.

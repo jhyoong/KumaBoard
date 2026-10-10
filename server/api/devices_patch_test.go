@@ -186,3 +186,36 @@ func TestRegisterSemanticsUnchanged(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// The dashboard Settings form always sends every field, so a device with no
+// MAC sends mac "". That must save, and an empty MAC must clear a stored one.
+func TestPatchAcceptsEmptyMAC(t *testing.T) {
+	e := newEnv(t)
+	e.login(t)
+	ctx := context.Background()
+	if _, _, err := e.st.CreateDevice(ctx, "no-mac", "", false, store.Schedule{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.st.CreateDevice(ctx, "has-mac", "aa:bb:cc:dd:ee:ff", false, store.Schedule{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"no-mac", "has-mac"} {
+		resp := e.do(t, "PATCH", "/api/devices/"+name, map[string]any{
+			"mac": "", "normally_off": false, "terminal_enabled": true,
+			"schedule": map[string]any{"expected_offline": []any{}, "grace_period_s": 0},
+		})
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s: patch with empty mac: %d", name, resp.StatusCode)
+		}
+		d, _ := e.st.GetDevice(ctx, name)
+		if d.MAC != "" || !d.TerminalEnabled {
+			t.Errorf("%s: mac %q, terminal_enabled %v", name, d.MAC, d.TerminalEnabled)
+		}
+	}
+	resp := e.do(t, "PATCH", "/api/devices/no-mac", map[string]any{"mac": "not-a-mac"})
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("malformed mac: %d, want 400", resp.StatusCode)
+	}
+}

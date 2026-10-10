@@ -139,6 +139,13 @@ func (h *Hub) serve(ctx context.Context, conn *websocket.Conn, remote string) {
 // so only an authenticated agent can record a reject reason on its own row.
 func (h *Hub) authenticate(ctx context.Context, hello *proto.Hello, remote string) (*Session, string) {
 	st := h.opts.Store
+	// The name comes from an unauthenticated peer and can be as large as the
+	// message limit. One that cannot be a device name is rejected before any
+	// database work, and without an audit row for it to fill.
+	if !proto.ValidName(hello.DeviceName) {
+		h.opts.Log.Warn("handshake rejected: malformed device name", "remote", remote, "name_bytes", len(hello.DeviceName))
+		return nil, proto.ErrUnknownDevice
+	}
 	d, err := st.GetDevice(ctx, hello.DeviceName)
 	if err != nil {
 		st.Audit(ctx, "agent:"+hello.DeviceName, "handshake", hello.DeviceName, proto.ErrUnknownDevice, remote)

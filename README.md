@@ -198,6 +198,10 @@ artifacts, and server config are archived, encrypted with `age` (public key only
 private key in the password manager), and sent to a second always-on host over SSH. Both sides keep
 the last 7 backups.
 
+The backup is not installed by `setup-server.sh`. Run `deploy/backup/install.sh` as root on
+the control plane host; `deploy/backup/restore.md` covers installing, restoring, the restore
+drill and moving a local run to the production layout.
+
 ## Server setup
 
 These steps are for the control plane host (Linux/amd64).

@@ -154,3 +154,19 @@ func TestCheckStartupStaleMarker(t *testing.T) {
 		t.Fatal("stale marker not deleted")
 	}
 }
+
+func TestWritePendingLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, PendingFile)
+	for _, v := range []string{"0.4.0", "0.5.0"} {
+		if err := WritePending(path, &Pending{FromVersion: "0.3.0", ToVersion: v}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p, err := ReadPending(path); err != nil || p.ToVersion != "0.5.0" {
+		t.Fatalf("pending %+v, err %v", p, err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("dir has %d entries, want 1", len(entries))
+	}
+}
